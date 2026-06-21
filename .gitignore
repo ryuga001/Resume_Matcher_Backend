@@ -1,0 +1,67 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+.venv/
+ENV/
+
+# Environment Variables
+.env
+.env.*
+
+# Django
+*.log
+db.sqlite3
+db.sqlite3-journal
+
+# Static & Media (if generated locally)
+staticfiles/
+media/
+
+# Migrations (optional - usually commit migrations)
+# */migrations/*.py
+# !*/migrations/__init__.py
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type Checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# Windows
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Poetry
+poetry.lock
+
+# Pipenv
+Pipfile.lock
