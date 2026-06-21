@@ -65,3 +65,5 @@ poetry.lock
 
 # Pipenv
 Pipfile.lock
+
+*__init__.py

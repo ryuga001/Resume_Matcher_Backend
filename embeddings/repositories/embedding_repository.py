@@ -1,18 +1,16 @@
 from common.mongodb.client import MongoDBClient
 
+
 class EmbeddingRepository:
-
     def __init__(self):
-        db = MongoDBClient.get_db()
-        self.collection = db['resume_chunks']
+        self.collection = MongoDBClient.get_db()["resume_chunks"]
 
-    
-    def save_many(self,documents):
+    def save_many(self, documents: list):
         self.collection.insert_many(documents)
 
-    def find_by_resume_id(self,resume_id):
-        return list(self.collection.find({"resumeId" : resume_id},{"_id":0}))
-    
+    def find_by_resume_id(self, resume_id: str):
+        return list(self.collection.find({"resumeId": resume_id}, {"_id": 0}))
+
     def vector_search(self, resume_id: str, query_embedding: list, limit: int = 5):
         pipeline = [
             {
@@ -22,9 +20,7 @@ class EmbeddingRepository:
                     "queryVector": query_embedding,
                     "numCandidates": 100,
                     "limit": limit,
-                    "filter": {
-                        "resumeId": resume_id
-                    }
+                    "filter": {"resumeId": resume_id},
                 }
             },
             {
@@ -33,11 +29,8 @@ class EmbeddingRepository:
                     "resumeId": 1,
                     "chunkIndex": 1,
                     "text": 1,
-                    "score": {
-                        "$meta": "vectorSearchScore"
-                    }
+                    "score": {"$meta": "vectorSearchScore"},
                 }
-            }
+            },
         ]
-
         return list(self.collection.aggregate(pipeline))
