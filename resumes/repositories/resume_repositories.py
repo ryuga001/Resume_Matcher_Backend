@@ -21,3 +21,6 @@ class ResumeRepository:
     def delete_resume(self, resume_id):
         result = self.collection.delete_one({"_id": resume_id})
         return result.deleted_count > 0
+
+    def get_all_resumes(self):
+        return list(self.collection.find({}, {"_id": 1, "fileName": 1}))

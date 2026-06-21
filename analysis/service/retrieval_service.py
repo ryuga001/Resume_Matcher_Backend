@@ -13,9 +13,8 @@ class RetrievalService:
 
         return np.dot(a,b)/(np.linalg.norm(a)*np.linalg.norm(b))
     
-
     @classmethod
-    def retrieve(cls, resume_id, job_description, top_k=5):
+    def retrieve_local_cosine(cls, resume_id, job_description, top_k=5):
         """
         Returns top-k most relevant resume chunks for the given job description
         """
@@ -41,3 +40,11 @@ class RetrievalService:
         scored_chunks.sort(key=lambda x:x["score"],reverse=True)
 
         return scored_chunks[:top_k]
+
+
+    @classmethod
+    def retrieve(cls, resume_id: str, job_description: str, top_k: int = 5):
+        jd_embeddings = EmbeddingService().create_embedding(job_description)
+        chunks = EmbeddingRepository().vector_search(resume_id, query_embedding=jd_embeddings, limit=top_k)
+        return chunks
+        
