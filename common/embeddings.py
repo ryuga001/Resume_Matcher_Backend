@@ -3,7 +3,7 @@ import json
 import numpy as np
 import google.generativeai as genai
 
-_EMBED_MODEL = "models/embedding-001"
+_EMBED_MODEL = "models/text-embedding-004"
 _CHUNK_TOKENS = 800    # ~600 words per chunk
 _OVERLAP_TOKENS = 80   # ~60 words overlap
 

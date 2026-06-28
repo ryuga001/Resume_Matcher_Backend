@@ -66,7 +66,7 @@ Output ONLY a valid JSON object with this exact structure (no markdown fences, n
 
 Rules:
 - theory: 3–5 sections, each with 3+ paragraphs of depth
-- diagrams: 1–3 diagrams relevant to the subtopic (flowcharts for processes, sequence for interactions, class for OOP)
+- diagrams: 1–3 diagrams. STRICT Mermaid syntax rules — node labels must contain plain text ONLY: no parentheses (), no brackets [], no colons :, no angle brackets <>, no quotes, no special characters. Use flowchart TD for processes, sequenceDiagram for interactions. Example safe node: A --> B[Simple Label] NOT A --> B[Method: foo(x)]
 - code_examples: 1–4 complete, runnable examples with inline comments
 - key_points: 4–8 actionable takeaways
 - quiz: exactly 5 multiple-choice questions, varying difficulty, correct index is 0-based
@@ -79,7 +79,7 @@ class GeminiService:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY", "")
         genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel("gemini-3.5-flash")
+        self._model = genai.GenerativeModel(os.getenv("GEMINI_MODEL"))
         self._s3    = S3Service()
 
     def generate_subtopics(self, source_key: str, topic: str) -> list[dict]:
@@ -167,7 +167,10 @@ class GeminiService:
         )
 
         try:
-            response = self._model.generate_content(prompt)
+            response = self._model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(max_output_tokens=8192),
+            )
             raw = response.text.strip()
         except Exception as exc:
             raise RuntimeError(f"Gemini call failed: {exc}") from exc
@@ -182,7 +185,7 @@ class GeminiService:
         try:
             content = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
+            raise RuntimeError(f"Gemini returned truncated/invalid JSON: {exc}") from exc
 
         if not isinstance(content, dict):
             raise RuntimeError("Gemini response was not a JSON object.")

@@ -1,5 +1,7 @@
 import json
+import time
 
+from django.http import StreamingHttpResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
@@ -114,10 +116,12 @@ class CourseDetailView(APIView):
 
 
 class SubtopicsGenerateView(APIView):
-    """POST — stream source file from S3, run Gemini agent, return draft list (not saved)."""
+    """POST — enqueue async subtopic generation, return taskId immediately."""
 
     @require_role("SUPER_ADMIN")
     def post(self, request, course_id):
+        from courses.tasks import generate_subtopics_task
+
         course = CourseRepository().get_by_id(course_id)
         if not course:
             return Response({"error": "Course not found."}, status=404)
@@ -126,12 +130,27 @@ class SubtopicsGenerateView(APIView):
         if not source_key:
             return Response({"error": "This course has no source file."}, status=400)
 
-        try:
-            subtopics = GeminiService().generate_subtopics(source_key, course["topic"])
-        except (ValueError, RuntimeError) as exc:
-            return Response({"error": str(exc)}, status=422)
+        result = generate_subtopics_task.delay(course_id)
+        return Response({"taskId": result.id})
 
-        return Response({"subtopics": subtopics})
+
+class SubtopicsTaskStatusView(APIView):
+    """GET — poll Celery task result for subtopic generation."""
+
+    @require_role("SUPER_ADMIN")
+    def get(self, request, course_id, task_id):
+        from celery.result import AsyncResult
+        result = AsyncResult(task_id)
+
+        if result.state == "SUCCESS":
+            return Response({"status": "done", "subtopics": result.result})
+
+        if result.state == "FAILURE":
+            err = str(result.result) if result.result else "Generation failed."
+            err = err.splitlines()[0]
+            return Response({"status": "error", "error": err})
+
+        return Response({"status": "running"})
 
 
 class SubtopicsView(APIView):
@@ -210,6 +229,20 @@ class SubtopicContentView(APIView):
         except Exception:
             return Response({"error": "Could not load content from storage."}, status=500)
         return Response({"content": content, "subtopic": subtopic})
+
+    @require_role("SUPER_ADMIN")
+    def post(self, request, course_id, order):
+        """Enqueue generation for a single subtopic."""
+        from courses.tasks import generate_subtopic_content_task
+        order = int(order)
+        repo = CourseRepository()
+        subtopic = repo.get_subtopic(course_id, order)
+        if not subtopic:
+            return Response({"error": "Subtopic not found."}, status=404)
+        # Mark synchronously so the UI sees "generating" on the next poll
+        repo.update_subtopic_field(course_id, order, {"status": "generating", "contentKey": ""})
+        generate_subtopic_content_task.delay(course_id, order)
+        return Response({"queued": True})
 
     @require_role("SUPER_ADMIN")
     def put(self, request, course_id, order):
