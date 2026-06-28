@@ -9,6 +9,7 @@ from courses.api.views import (
     ContentGenerateView,
     ContentStatusView,
     SubtopicContentView,
+    SubtopicChatView,
 )
 
 urlpatterns = [
@@ -18,6 +19,7 @@ urlpatterns = [
     path("/<str:course_id>/subtopics",                            SubtopicsView.as_view()),
     path("/<str:course_id>/content/generate",                     ContentGenerateView.as_view()),
     path("/<str:course_id>/content/status",                       ContentStatusView.as_view()),
+    path("/<str:course_id>/content/<int:order>/chat",             SubtopicChatView.as_view()),
     path("/<str:course_id>/content/<int:order>",                  SubtopicContentView.as_view()),
     path("/<str:course_id>",                                      CourseDetailView.as_view()),
     path("",                                                      CourseListView.as_view()),

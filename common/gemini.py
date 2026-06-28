@@ -6,6 +6,15 @@ import google.generativeai as genai
 
 from common.s3 import S3Service
 
+_CHAT_SYSTEM = """You are an AI study assistant for the course "{topic}", subtopic "{subtopic_title}".
+
+Answer the student's question using ONLY the context below. Be concise, clear, and educational.
+If the answer is not covered in the context, say so honestly rather than guessing.
+
+Context:
+{context}
+"""
+
 _SUBTOPIC_PROMPT = """You are a curriculum designer.
 
 Analyse the course content below (topic: "{topic}") and return a comprehensive list of subtopics a learner must master.
@@ -195,6 +204,40 @@ class GeminiService:
         self._s3.put_text(s3_key, json.dumps(content, ensure_ascii=False), "application/json")
 
         return content, s3_key
+
+    def chat_subtopic(
+        self,
+        topic: str,
+        subtopic_title: str,
+        context: str,
+        history: list[dict],
+        message: str,
+    ) -> str:
+        """
+        Multi-turn RAG chat for a subtopic.
+        `history` is a list of {role: "user"|"model", content: str} dicts.
+        """
+        system_prompt = _CHAT_SYSTEM.format(
+            topic=topic,
+            subtopic_title=subtopic_title,
+            context=context or "No context available.",
+        )
+
+        gemini_history = [
+            {"role": h["role"], "parts": [h["content"]]}
+            for h in history
+            if h.get("role") in ("user", "model") and h.get("content")
+        ]
+
+        chat = self._model.start_chat(history=gemini_history)
+        try:
+            response = chat.send_message(
+                f"{system_prompt}\n\nStudent question: {message}",
+                generation_config=genai.GenerationConfig(max_output_tokens=1024),
+            )
+            return response.text.strip()
+        except Exception as exc:
+            raise RuntimeError(f"Gemini chat failed: {exc}") from exc
 
     # ── Private helpers ───────────────────────────────────────────────────────
 

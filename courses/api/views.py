@@ -1,7 +1,5 @@
 import json
-import time
 
-from django.http import StreamingHttpResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
@@ -273,3 +271,67 @@ class SubtopicContentView(APIView):
             pass  # Don't fail the save if re-embedding fails
 
         return Response({"ok": True})
+
+
+class SubtopicChatView(APIView):
+    """POST — RAG-based chat for a specific subtopic."""
+
+    @require_auth
+    def post(self, request, course_id, order):
+        message = request.data.get("message", "").strip()
+        history = request.data.get("history", [])
+
+        if not message:
+            return Response({"error": "message is required."}, status=400)
+
+        repo   = CourseRepository()
+        course = repo.get_by_id(course_id)
+        if not course:
+            return Response({"error": "Course not found."}, status=404)
+
+        subtopic = repo.get_subtopic(course_id, int(order))
+        if not subtopic:
+            return Response({"error": "Subtopic not found."}, status=404)
+
+        content_key = subtopic.get("contentKey", "")
+        if not content_key:
+            return Response({"error": "Content not generated yet for this subtopic."}, status=400)
+
+        # Load content from S3 and build context text
+        try:
+            raw     = s3.get_text(content_key)
+            content = json.loads(raw)
+        except Exception:
+            return Response({"error": "Could not load subtopic content."}, status=500)
+
+        context_parts: list[str] = []
+        if overview := content.get("overview"):
+            context_parts.append(f"Overview:\n{overview}")
+        for t in content.get("theory", []):
+            context_parts.append(f"{t.get('heading', '')}:\n{t.get('body', '')}")
+        if kp := content.get("key_points"):
+            context_parts.append("Key Points:\n" + "\n".join(f"- {k}" for k in kp))
+        context_text = "\n\n".join(context_parts)
+
+        # Narrow context via RAG if embeddings exist
+        try:
+            from common.embeddings import EmbeddingService
+            from common.mongodb.client import MongoDBClient
+            chunks = EmbeddingService().search(MongoDBClient.get_db(), course_id, message, top_k=5)
+            if chunks:
+                context_text = "\n\n---\n\n".join(c["text"] for c in chunks)
+        except Exception:
+            pass  # Fall back to full content context
+
+        try:
+            reply = GeminiService().chat_subtopic(
+                topic=course["topic"],
+                subtopic_title=subtopic["title"],
+                context=context_text,
+                history=history,
+                message=message,
+            )
+        except RuntimeError as exc:
+            return Response({"error": str(exc)}, status=503)
+
+        return Response({"reply": reply})
