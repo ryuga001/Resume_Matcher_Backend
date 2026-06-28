@@ -62,12 +62,51 @@ class CourseRepository:
         return self._serialize(result) if result else None
 
     def save_subtopics(self, course_id: str, subtopics: list) -> dict | None:
+        # Preserve any existing contentKey/status when re-saving subtopics
+        existing = self.get_by_id(course_id)
+        existing_map: dict = {}
+        if existing:
+            for s in existing.get("subtopics", []):
+                existing_map[s["order"]] = {
+                    "status":     s.get("status", "pending"),
+                    "contentKey": s.get("contentKey", ""),
+                }
+
+        enriched = []
+        for s in subtopics:
+            prev = existing_map.get(s["order"], {})
+            enriched.append({
+                **s,
+                "status":     prev.get("status", "pending"),
+                "contentKey": prev.get("contentKey", ""),
+            })
+
         result = self.collection.find_one_and_update(
             {"_id": ObjectId(course_id)},
-            {"$set": {"subtopics": subtopics, "updatedAt": datetime.now(timezone.utc).isoformat()}},
+            {"$set": {"subtopics": enriched, "updatedAt": datetime.now(timezone.utc).isoformat()}},
             return_document=True,
         )
         return self._serialize(result) if result else None
+
+    def update_subtopic_field(self, course_id: str, order: int, fields: dict) -> bool:
+        """Update specific fields on a single subtopic identified by its order number."""
+        set_payload = {f"subtopics.$.{k}": v for k, v in fields.items()}
+        set_payload["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        result = self.collection.update_one(
+            {"_id": ObjectId(course_id), "subtopics.order": order},
+            {"$set": set_payload},
+        )
+        return result.modified_count > 0
+
+    def get_subtopic(self, course_id: str, order: int) -> dict | None:
+        """Return a single subtopic dict by order number."""
+        course = self.get_by_id(course_id)
+        if not course:
+            return None
+        for s in course.get("subtopics", []):
+            if s.get("order") == order:
+                return s
+        return None
 
     def delete(self, course_id: str) -> bool:
         result = self.collection.delete_one({"_id": ObjectId(course_id)})

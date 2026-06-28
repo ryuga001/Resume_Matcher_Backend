@@ -42,3 +42,14 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [],
     "DEFAULT_PERMISSION_CLASSES": [],
 }
+
+# ── Celery ────────────────────────────────────────────────────────────────────
+CELERY_BROKER_URL        = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND    = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CELERY_TASK_SERIALIZER   = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT    = ["json"]
+CELERY_TIMEZONE          = "UTC"
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_SOFT_TIME_LIMIT = 360   # 6 min per subtopic task
+CELERY_TASK_TIME_LIMIT      = 420

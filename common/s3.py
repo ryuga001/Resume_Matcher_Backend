@@ -130,3 +130,19 @@ class S3Service:
             )
         except (BotoCoreError, ClientError):
             pass
+
+    # ── Text helpers ──────────────────────────────────────────────────────────
+
+    def put_text(self, key: str, text: str, content_type: str = "text/markdown; charset=utf-8") -> None:
+        """Upload a UTF-8 string directly to S3 (no temp file needed)."""
+        self._client().put_object(
+            Bucket=self._bucket,
+            Key=key,
+            Body=text.encode("utf-8"),
+            ContentType=content_type,
+        )
+
+    def get_text(self, key: str) -> str:
+        """Download a text object from S3 and return its contents as a string."""
+        obj = self._client().get_object(Bucket=self._bucket, Key=key)
+        return obj["Body"].read().decode("utf-8")

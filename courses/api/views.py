@@ -1,3 +1,5 @@
+import json
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
@@ -158,3 +160,83 @@ class SubtopicsView(APIView):
             return Response({"error": "Course not found."}, status=404)
 
         return Response({"subtopics": course.get("subtopics", [])})
+
+
+class ContentGenerateView(APIView):
+    """POST — enqueue Celery tasks to generate content for all subtopics."""
+
+    @require_role("SUPER_ADMIN")
+    def post(self, request, course_id):
+        from courses.tasks import generate_course_content
+        course = CourseRepository().get_by_id(course_id)
+        if not course:
+            return Response({"error": "Course not found."}, status=404)
+        if not course.get("subtopics"):
+            return Response({"error": "No subtopics — generate subtopics first."}, status=400)
+        result = generate_course_content.delay(course_id)
+        return Response({"taskId": result.id, "queued": True})
+
+
+class ContentStatusView(APIView):
+    """GET — return subtopic-level generation statuses."""
+
+    @require_auth
+    def get(self, request, course_id):
+        course = CourseRepository().get_by_id(course_id)
+        if not course:
+            return Response({"error": "Course not found."}, status=404)
+        statuses = [
+            {"order": s["order"], "status": s.get("status", "pending")}
+            for s in course.get("subtopics", [])
+        ]
+        return Response({"statuses": statuses})
+
+
+class SubtopicContentView(APIView):
+    """GET — fetch generated content JSON. PUT — admin saves edited content."""
+
+    @require_auth
+    def get(self, request, course_id, order):
+        order = int(order)
+        subtopic = CourseRepository().get_subtopic(course_id, order)
+        if not subtopic:
+            return Response({"error": "Subtopic not found."}, status=404)
+        content_key = subtopic.get("contentKey", "")
+        if not content_key or subtopic.get("status") != "done":
+            return Response({"error": "Content not yet generated."}, status=404)
+        try:
+            raw = s3.get_text(content_key)
+            content = json.loads(raw)
+        except Exception:
+            return Response({"error": "Could not load content from storage."}, status=500)
+        return Response({"content": content, "subtopic": subtopic})
+
+    @require_role("SUPER_ADMIN")
+    def put(self, request, course_id, order):
+        order = int(order)
+        content = request.data.get("content")
+        if not isinstance(content, dict):
+            return Response({"error": "content must be a JSON object."}, status=400)
+
+        subtopic = CourseRepository().get_subtopic(course_id, order)
+        if not subtopic:
+            return Response({"error": "Subtopic not found."}, status=404)
+
+        content_key = subtopic.get("contentKey", "")
+        if not content_key:
+            return Response({"error": "No content key — content was never generated."}, status=400)
+
+        try:
+            s3.put_text(content_key, json.dumps(content, ensure_ascii=False), "application/json")
+        except Exception as exc:
+            return Response({"error": f"Could not save content: {exc}"}, status=500)
+
+        # Re-embed updated content
+        from common.embeddings import EmbeddingService
+        from common.mongodb.client import MongoDBClient
+        try:
+            EmbeddingService().index_content(MongoDBClient.get_db(), course_id, order, content)
+        except Exception:
+            pass  # Don't fail the save if re-embedding fails
+
+        return Response({"ok": True})

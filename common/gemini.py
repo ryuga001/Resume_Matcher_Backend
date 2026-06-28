@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 
 import google.generativeai as genai
 
@@ -19,6 +20,59 @@ Course content:
 """
 
 _MAX_CONTENT_CHARS = 60_000   # ~15k tokens — enough for most docs
+
+_CONTENT_PROMPT = """You are an expert technical educator. Generate comprehensive, high-quality learning content for the following subtopic.
+
+Course: "{topic}"
+Subtopic: "{subtopic_title}" (Difficulty: {difficulty})
+
+Reference material from the source document:
+{reference_content}
+
+Output ONLY a valid JSON object with this exact structure (no markdown fences, no extra text):
+{{
+  "overview": "<2-3 sentence introduction to the subtopic and why it matters>",
+  "theory": [
+    {{
+      "heading": "<section heading>",
+      "body": "<detailed explanation — min 3 paragraphs. Use clear, precise language. Cover concepts deeply.>"
+    }}
+  ],
+  "diagrams": [
+    {{
+      "title": "<diagram title>",
+      "description": "<one sentence explaining what the diagram shows>",
+      "mermaid": "<valid Mermaid.js diagram code — flowchart, sequence, class, or ER. MUST be syntactically correct.>"
+    }}
+  ],
+  "code_examples": [
+    {{
+      "title": "<example title>",
+      "language": "<programming language>",
+      "code": "<complete, runnable code snippet with comments>",
+      "explanation": "<what the code does and key points to understand>"
+    }}
+  ],
+  "key_points": ["<concise takeaway>"],
+  "quiz": [
+    {{
+      "question": "<clear, specific question testing understanding>",
+      "options": ["<option A>", "<option B>", "<option C>", "<option D>"],
+      "correct": 0,
+      "explanation": "<why this answer is correct and others are not>"
+    }}
+  ]
+}}
+
+Rules:
+- theory: 3–5 sections, each with 3+ paragraphs of depth
+- diagrams: 1–3 diagrams relevant to the subtopic (flowcharts for processes, sequence for interactions, class for OOP)
+- code_examples: 1–4 complete, runnable examples with inline comments
+- key_points: 4–8 actionable takeaways
+- quiz: exactly 5 multiple-choice questions, varying difficulty, correct index is 0-based
+- All content must be accurate, educational, and professional
+- Mermaid syntax must be valid — test mentally before generating
+"""
 
 
 class GeminiService:
@@ -77,6 +131,67 @@ class GeminiService:
             for i, s in enumerate(subtopics)
             if s.get("title")
         ]
+
+    def generate_subtopic_content(
+        self,
+        source_key: str,
+        topic: str,
+        subtopic_title: str,
+        difficulty: str,
+    ) -> tuple[dict, str]:
+        """
+        Generate full structured content for a single subtopic.
+
+        Returns:
+            (content_dict, s3_key) where content_dict is the parsed JSON and
+            s3_key is the key under which the raw JSON was uploaded to S3.
+
+        Raises:
+            ValueError  — unsupported file type or empty content.
+            RuntimeError — Gemini call failed or bad JSON.
+        """
+        ext = source_key.rsplit(".", 1)[-1].lower() if "." in source_key else ""
+
+        with self._s3.stream_to_temp(source_key) as tmp_path:
+            reference_content = self._extract_text(tmp_path, ext)
+
+        if not reference_content.strip():
+            raise ValueError("Could not extract text from the source file.")
+
+        reference_content = reference_content[:_MAX_CONTENT_CHARS]
+        prompt = _CONTENT_PROMPT.format(
+            topic=topic,
+            subtopic_title=subtopic_title,
+            difficulty=difficulty,
+            reference_content=reference_content,
+        )
+
+        try:
+            response = self._model.generate_content(prompt)
+            raw = response.text.strip()
+        except Exception as exc:
+            raise RuntimeError(f"Gemini call failed: {exc}") from exc
+
+        # Strip accidental markdown fences
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        try:
+            content = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
+
+        if not isinstance(content, dict):
+            raise RuntimeError("Gemini response was not a JSON object.")
+
+        # Upload to S3 as .json
+        s3_key = f"courses/content/{uuid.uuid4()}.json"
+        self._s3.put_text(s3_key, json.dumps(content, ensure_ascii=False), "application/json")
+
+        return content, s3_key
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
