@@ -61,6 +61,14 @@ class CourseRepository:
         )
         return self._serialize(result) if result else None
 
+    def save_subtopics(self, course_id: str, subtopics: list) -> dict | None:
+        result = self.collection.find_one_and_update(
+            {"_id": ObjectId(course_id)},
+            {"$set": {"subtopics": subtopics, "updatedAt": datetime.now(timezone.utc).isoformat()}},
+            return_document=True,
+        )
+        return self._serialize(result) if result else None
+
     def delete(self, course_id: str) -> bool:
         result = self.collection.delete_one({"_id": ObjectId(course_id)})
         return result.deleted_count > 0

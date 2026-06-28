@@ -1,5 +1,7 @@
 import os
+import tempfile
 import uuid
+from contextlib import contextmanager
 
 import boto3
 
@@ -91,6 +93,30 @@ class S3Service:
             self._client().delete_object(Bucket=self._bucket, Key=key)
         except (BotoCoreError, ClientError):
             pass
+
+    @contextmanager
+    def stream_to_temp(self, key: str):
+        """
+        Stream an S3 object to a named temp file in 8 MB chunks — never loads
+        the whole file into Python memory.  Yields the temp file path; deletes
+        the file when the context exits.
+        """
+        obj  = self._client().get_object(Bucket=self._bucket, Key=key)
+        body = obj["Body"]
+        ext  = key.rsplit(".", 1)[-1] if "." in key else "bin"
+        tmp  = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+        try:
+            for chunk in body.iter_chunks(chunk_size=8 * 1024 * 1024):
+                tmp.write(chunk)
+            tmp.flush()
+            tmp.close()
+            yield tmp.name
+        finally:
+            tmp.close()
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
     def delete_many(self, keys: list[str]) -> None:
         """Batch-delete up to 1 000 objects in a single S3 request."""

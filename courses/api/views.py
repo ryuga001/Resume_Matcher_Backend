@@ -2,6 +2,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from common.s3 import S3Service
+from common.gemini import GeminiService
 from users.auth import require_auth, require_role
 from courses.repository import CourseRepository, VALID_STATUSES
 
@@ -92,6 +93,7 @@ class CourseDetailView(APIView):
 
     @require_role("SUPER_ADMIN")
     def delete(self, request, course_id):
+
         repo   = CourseRepository()
         course = repo.get_by_id(course_id)
         if not course:
@@ -107,3 +109,52 @@ class CourseDetailView(APIView):
         s3.delete_many(keys)
 
         return Response({"ok": True})
+
+
+class SubtopicsGenerateView(APIView):
+    """POST — stream source file from S3, run Gemini agent, return draft list (not saved)."""
+
+    @require_role("SUPER_ADMIN")
+    def post(self, request, course_id):
+        course = CourseRepository().get_by_id(course_id)
+        if not course:
+            return Response({"error": "Course not found."}, status=404)
+
+        source_key = course.get("sourceFileKey", "")
+        if not source_key:
+            return Response({"error": "This course has no source file."}, status=400)
+
+        try:
+            subtopics = GeminiService().generate_subtopics(source_key, course["topic"])
+        except (ValueError, RuntimeError) as exc:
+            return Response({"error": str(exc)}, status=422)
+
+        return Response({"subtopics": subtopics})
+
+
+class SubtopicsView(APIView):
+    """PUT — save the (possibly edited) subtopics list to MongoDB."""
+
+    @require_role("SUPER_ADMIN")
+    def put(self, request, course_id):
+        subtopics = request.data.get("subtopics")
+        if not isinstance(subtopics, list):
+            return Response({"error": "subtopics must be an array."}, status=400)
+
+        # Normalise & re-number
+        valid_difficulties = {"Beginner", "Intermediate", "Advanced"}
+        cleaned = []
+        for i, s in enumerate(subtopics):
+            title = str(s.get("title", "")).strip()
+            if not title:
+                continue
+            difficulty = s.get("difficulty", "Intermediate")
+            if difficulty not in valid_difficulties:
+                difficulty = "Intermediate"
+            cleaned.append({"title": title, "difficulty": difficulty, "order": i + 1})
+
+        course = CourseRepository().save_subtopics(course_id, cleaned)
+        if not course:
+            return Response({"error": "Course not found."}, status=404)
+
+        return Response({"subtopics": course.get("subtopics", [])})
