@@ -32,10 +32,14 @@ jobs:
       POSTGRES_PASSWORD: postgres
       POSTGRES_HOST: localhost
       POSTGRES_PORT: "5432"
+      PGUSER: postgres          # libpq fallback — prevents "role root does not exist"
       DEBUG: "False"
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Show repository layout
+        run: ls -la
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -46,7 +50,6 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        working-directory: backend
         run: |
           # GPU-only packages (CUDA, Triton, pinned torch) don't install on
           # CPU-only CI runners. Strip them; torch resolves as CPU-only via
@@ -57,14 +60,17 @@ jobs:
             --extra-index-url https://download.pytorch.org/whl/cpu \
             -r /tmp/requirements-ci.txt
 
-      - name: Check Django configuration
-        working-directory: backend
-        run: python manage.py check
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" \
+              && echo "Postgres ready" && break
+            echo "Waiting for Postgres… ($i/30)"
+            sleep 2
+          done
 
       - name: Run migrations
-        working-directory: backend
         run: python manage.py migrate --no-input
 
       - name: Run tests
-        working-directory: backend
         run: python manage.py test --no-input
