@@ -1,6 +1,8 @@
 from bson import ObjectId
 from common.mongodb.client import MongoDBClient
 
+ROLES = ("SUPER_ADMIN", "USER")
+
 
 class UserRepository:
     def __init__(self):
@@ -8,8 +10,10 @@ class UserRepository:
         self.collection = self.db["users"]
         self.collection.create_index("email", unique=True)
 
-    def create_user(self, email: str, hashed_password: str, name: str) -> str:
-        doc = {"email": email, "password": hashed_password, "name": name, "usesLeft": 10}
+    def create_user(self, email: str, hashed_password: str, name: str, role: str = "USER") -> str:
+        if role not in ROLES:
+            raise ValueError(f"Invalid role: {role}")
+        doc = {"email": email, "password": hashed_password, "name": name, "role": role, "usesLeft": 10}
         result = self.collection.insert_one(doc)
         return str(result.inserted_id)
 
