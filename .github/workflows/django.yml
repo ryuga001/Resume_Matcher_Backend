@@ -57,6 +57,7 @@ jobs:
           grep -vE "^(cuda-|nvidia-|triton==|torch==)" requirements.txt \
             > /tmp/requirements-ci.txt
           uv pip install --system \
+            --index-strategy unsafe-best-match \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             -r /tmp/requirements-ci.txt
 
