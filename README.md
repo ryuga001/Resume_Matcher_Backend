@@ -8,14 +8,16 @@ Django REST API powering resume analysis, AI-driven ATS scoring, and the Sahara 
 
 | Layer | Technology |
 |-------|-----------|
-| API | Django 5 + Django REST Framework |
-| Database | MongoDB (PyMongo) — schemaless, no migrations |
-| Task queue | Celery + Redis |
-| AI / LLM | Google Gemini (via `google-generativeai`) |
-| Embeddings | Gemini `text-embedding-004` — stored in `course_chunks` collection |
-| Storage | MinIO (S3-compatible) — PDFs, thumbnails, generated content JSON |
-| Auth | PyJWT — stateless Bearer tokens |
+| API | Django 6 + Django REST Framework |
+| Database | PostgreSQL 16 + pgvector |
+| Task queue | RabbitMQ + pika — three dedicated worker processes |
+| AI / LLM | Google Gemini via `google-genai` SDK |
+| Resume embeddings | `sentence-transformers` — `all-MiniLM-L6-v2` (384-dim, local) |
+| Course embeddings | Gemini `text-embedding-004` (768-dim) |
+| Storage | AWS S3 (or any S3-compatible store via `S3_ENDPOINT_URL`) |
+| Auth | PyJWT — stateless Bearer tokens issued as HTTP-only cookies |
 | PDF parsing | PyMuPDF (`fitz`) |
+| Package manager | uv |
 
 ---
 
@@ -24,23 +26,30 @@ Django REST API powering resume analysis, AI-driven ATS scoring, and the Sahara 
 ```
 backend/
 ├── config/
-│   ├── settings.py        # All config — env-driven
-│   └── urls.py            # Root URL conf
-├── users/                 # Auth: register, login, JWT, profile
-├── resumes/               # PDF upload → S3, text extraction, embedding index
-├── analysis/              # ATS scoring, skill-gap analysis, history
-├── courses/               # Academy: courses, subtopics, content generation, RAG chat
+│   ├── settings.py          # All config — env-driven
+│   └── urls.py              # Root URL conf
+├── users/                   # Auth: register, login, JWT, profile, refresh, logout
+├── resumes/                 # PDF upload → S3, text extraction, MiniLM embedding + index
+├── analysis/                # ATS scoring, skill-gap analysis, history
+├── courses/                 # Academy: courses, subtopics, content generation, RAG chat
 │   ├── api/
-│   │   ├── views.py       # All course API views
-│   │   └── urls.py        # Course URL patterns
-│   ├── repository.py      # MongoDB queries for courses collection
-│   └── tasks.py           # Celery tasks: subtopic gen, content gen
+│   │   ├── views.py         # All course API views
+│   │   └── urls.py
+│   ├── models.py            # Course, Subtopic, TaskRecord (ORM)
+│   ├── repository.py        # DB queries
+│   └── task_handlers.py     # Business logic called by workers
+├── embeddings/              # Resume embedding service (MiniLM)
+│   ├── service/
+│   └── repositories/
 ├── common/
-│   ├── gemini.py          # GeminiService: subtopics, content, chat
-│   ├── embeddings.py      # EmbeddingService: chunk → embed → MongoDB
-│   ├── s3.py              # S3Service: presign, upload, download, stream
-│   └── mongodb/           # MongoDBClient singleton
-├── celery_app.py          # Celery app entry point
+│   ├── gemini.py            # GeminiService: subtopics, content gen, RAG chat
+│   ├── embeddings.py        # EmbeddingService: Gemini text-embedding-004
+│   ├── rabbitmq.py          # publish() / consume() helpers with auto-reconnect
+│   └── s3.py                # S3Service: presign, upload, download, stream
+├── workers/
+│   ├── subtopic_worker.py   # Consumes 'subtopics_generation' queue
+│   ├── content_worker.py    # Consumes 'content_generation' queue
+│   └── bulk_content_worker.py  # Consumes 'bulk_content_generation' queue
 └── manage.py
 ```
 
@@ -48,12 +57,17 @@ backend/
 
 ## API Endpoints
 
+All routes except `register`, `login`, and `refresh` require `Authorization: Bearer <token>`.  
+Admin routes additionally require `role == "SUPER_ADMIN"`.
+
 ### Auth — `/api/auth/`
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/api/auth/register` | — | Create account |
-| POST | `/api/auth/login` | — | Login, returns JWT |
+| POST | `/api/auth/login` | — | Login, returns JWT (HTTP-only cookie + body) |
+| POST | `/api/auth/logout` | — | Clear auth cookie |
+| POST | `/api/auth/refresh` | — | Refresh access token |
 | GET | `/api/auth/me` | ✓ | Current user profile |
 | PATCH | `/api/auth/profile` | ✓ | Update name / password |
 
@@ -62,15 +76,15 @@ backend/
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | `/api/resumes/list` | ✓ | List user's resumes |
-| POST | `/api/resumes/upload` | ✓ | Upload PDF resume |
-| DELETE | `/api/resumes/<id>` | ✓ | Delete resume |
+| POST | `/api/resumes/upload` | ✓ | Upload PDF, extract text, index embeddings |
+| DELETE | `/api/resumes/<id>` | ✓ | Delete resume + S3 asset |
 
 ### Analysis — `/api/analysis`
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/api/analysis` | ✓ | Run ATS analysis |
-| GET | `/api/analysis/history` | ✓ | Analysis history |
+| POST | `/api/analysis` | ✓ | Run ATS analysis — returns score, skills, recommendations |
+| GET | `/api/analysis/history` | ✓ | Full analysis history |
 | GET | `/api/analysis/<id>` | ✓ | Single analysis detail |
 
 ### Academy — `/api/courses`
@@ -83,30 +97,25 @@ backend/
 | PATCH | `/api/courses/<id>` | admin | Update course |
 | DELETE | `/api/courses/<id>` | admin | Delete course + S3 assets |
 | POST | `/api/courses/presign` | admin | Presign S3 PUT for source PDF / thumbnail |
-| POST | `/api/courses/<id>/subtopics/generate` | admin | Async subtopic generation (returns `taskId`) |
-| GET | `/api/courses/<id>/subtopics/status/<taskId>` | admin | Poll subtopic generation task |
+| POST | `/api/courses/<id>/subtopics/generate` | admin | Enqueue subtopic generation (returns `taskId`) |
+| GET | `/api/courses/<id>/subtopics/status/<taskId>` | admin | Poll subtopic task status |
 | PUT | `/api/courses/<id>/subtopics` | admin | Save / reorder subtopic list |
-| POST | `/api/courses/<id>/content/generate` | admin | Sequential content generation for all subtopics |
+| POST | `/api/courses/<id>/content/generate` | admin | Enqueue content generation for all subtopics |
 | GET | `/api/courses/<id>/content/status` | any | Per-subtopic generation status |
-| POST | `/api/courses/<id>/content/<order>` | admin | Generate content for one subtopic |
-| GET | `/api/courses/<id>/content/<order>` | any | Fetch generated content JSON |
-| PUT | `/api/courses/<id>/content/<order>` | admin | Save edited content + re-embed |
+| GET/POST/PUT | `/api/courses/<id>/content/<order>` | any/admin | Fetch / generate / save subtopic content |
 | POST | `/api/courses/<id>/content/<order>/chat` | any | RAG chat for a subtopic |
-
-All routes except register/login require `Authorization: Bearer <token>`.  
-Admin routes additionally require `role == "SUPER_ADMIN"`.
 
 ---
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, MongoDB, Redis, MinIO (or any S3-compatible store)
+**Prerequisites:** Python 3.12+, PostgreSQL 16 with pgvector, RabbitMQ 3+
 
 ```bash
-# From repo root
-python -m venv .venv
+cd backend
+uv venv
 source .venv/bin/activate
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 Create `backend/.env`:
@@ -116,30 +125,44 @@ DJANGO_SECRET_KEY=your-secret-key-32-chars-minimum
 JWT_SECRET=your-jwt-secret-32-chars-minimum
 DEBUG=True
 
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB=sahara
+POSTGRES_DB=sahara
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
 
-REDIS_URL=redis://localhost:6379/0
+RABBITMQ_URL=amqp://guest:guest@localhost:5672/
 
 GEMINI_API_KEY=AIza...
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-2.0-flash
 
-S3_ENDPOINT=http://localhost:9000
-S3_ACCESS_KEY=minioadmin
-S3_SECRET_KEY=minioadmin
-S3_BUCKET=sahara
-S3_REGION=us-east-1
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_S3_BUCKET=sahara
+AWS_REGION=us-east-1
+# S3_ENDPOINT_URL=http://localhost:9000  # uncomment for local S3-compatible store
 
 FRONTEND_URI=http://localhost:3000
+COOKIE_SECURE=false
 ```
 
 ```bash
-# Start Django
-cd backend
+# Apply migrations (creates tables + enables pgvector extension)
+python manage.py migrate
+
+# Start the Django API
 python manage.py runserver
 
-# Start Celery worker (separate terminal, .venv activated)
-celery -A celery_app worker --loglevel=info
+# Start workers — each in its own terminal, .venv activated, from backend/
+python workers/subtopic_worker.py
+python workers/content_worker.py
+python workers/bulk_content_worker.py
+```
+
+Or use Docker Compose for all infrastructure (PostgreSQL, RabbitMQ, Redis, Mailpit):
+
+```bash
+docker compose up -d
 ```
 
 API available at `http://localhost:8000`.
@@ -149,24 +172,29 @@ API available at `http://localhost:8000`.
 ## Key Concepts
 
 ### Authentication
-JWT tokens are issued on register/login (7-day expiry). The `@require_auth` decorator validates the `Authorization: Bearer <token>` header and injects `request.user_id`, `request.user_email`, and `request.user_role`. Admin-only views use `@require_role("SUPER_ADMIN")`.
+JWT tokens are issued on register/login and set as HTTP-only cookies (7-day expiry). The `@require_auth` decorator validates the `Authorization: Bearer <token>` header and injects `request.user_id`, `request.user_email`, and `request.user_role`. Admin-only views additionally call `@require_role("SUPER_ADMIN")`.
 
 ### Resume Processing
-Uploaded PDFs are stored in S3. Text is extracted with PyMuPDF, chunked, embedded with Gemini `text-embedding-004`, and stored in MongoDB's `resume_chunks` collection. The `indexStatus` field (`processing → ready | error`) is polled by the frontend.
+Uploaded PDFs are stored in S3. Text is extracted with PyMuPDF, chunked, and embedded locally using `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim). Vectors are stored in PostgreSQL via pgvector. The `indexStatus` field (`processing → ready | error`) is polled by the frontend.
 
 ### Course Content Generation
 1. Admin uploads a source PDF to S3 via a presigned URL
-2. **Subtopic generation**: Celery task streams the PDF from S3, sends it to Gemini Flash, returns a structured subtopic list
-3. **Content generation**: Admin clicks Generate on individual subtopics. Each task:
-   - Calls `GeminiService.generate_subtopic_content()` → structured JSON (overview, theory, diagrams, code, quiz)
-   - Uploads the JSON to S3 (`courses/content/<uuid>.json`)
-   - Embeds content chunks into MongoDB `course_chunks` for RAG
-   - Updates subtopic `status` → `"done"` with `contentKey`
-4. **Rate limiting**: 429 errors parse Gemini's `retry_delay` and sleep + retry automatically
+2. **Subtopic generation** — a `TaskRecord` is created, then a message is published to the `subtopics_generation` RabbitMQ queue. `subtopic_worker.py` picks it up, streams the PDF from S3, calls Gemini Flash, and writes a structured subtopic list to the DB. The frontend polls the task status endpoint every 2 s.
+3. **Per-subtopic content generation** — admin triggers generation per subtopic. A message is published to `content_generation`; `content_worker.py` calls `GeminiService.generate_subtopic_content()`, uploads the result JSON to S3, and embeds content chunks (768-dim via Gemini `text-embedding-004`) into PostgreSQL for RAG search.
+4. **Bulk generation** — `POST /content/generate` enqueues a single message to `bulk_content_generation`; `bulk_content_worker.py` runs subtopics sequentially, acting as a natural rate-limit throttle for the Gemini free tier.
+
+### RabbitMQ Workers
+Workers use `pika` with heartbeat disabled (`heartbeat=0`) so that long-running Gemini API calls (30–120 s for PDF analysis) never cause RabbitMQ to close the connection mid-task. Each worker auto-reconnects with exponential backoff (5 s → 60 s) on connection loss.
 
 ### RAG Chat
 `POST /api/courses/<id>/content/<order>/chat`:
 1. Loads subtopic content JSON from S3 as base context
-2. Optionally narrows context using cosine similarity search over `course_chunks` embeddings
-3. Calls `GeminiService.chat_subtopic()` with full conversation history
+2. Narrows context using cosine-similarity search over pgvector course chunk embeddings
+3. Calls `GeminiService.chat_subtopic()` with the full conversation history
 4. Returns the model's reply
+
+### CI
+GitHub Actions (`.github/workflows/django.yml`) runs on every push/PR to `main`:
+- Spins up `pgvector/pgvector:pg16` as a service
+- Installs dependencies via `uv` (GPU-only packages stripped for CPU-only runners)
+- `manage.py check` → `migrate` → `test`

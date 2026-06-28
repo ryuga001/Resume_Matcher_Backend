@@ -2,29 +2,69 @@ name: Django CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 4
-      matrix:
-        python-version: [3.7, 3.8, 3.9]
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: sahara_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DJANGO_SECRET_KEY: ci-secret-key-not-for-production
+      POSTGRES_DB: sahara_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      DEBUG: "False"
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    - name: Run Tests
-      run: |
-        python manage.py test
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          # GPU-only packages (CUDA, Triton, pinned torch) don't install on
+          # CPU-only CI runners. Strip them; torch resolves as CPU-only via
+          # sentence-transformers' dependency resolution.
+          grep -vE "^(cuda-|nvidia-|triton==|torch==)" requirements.txt \
+            > /tmp/requirements-ci.txt
+          uv pip install --system \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r /tmp/requirements-ci.txt
+
+      - name: Check Django configuration
+        working-directory: backend
+        run: python manage.py check
+
+      - name: Run migrations
+        working-directory: backend
+        run: python manage.py migrate --no-input
+
+      - name: Run tests
+        working-directory: backend
+        run: python manage.py test --no-input
