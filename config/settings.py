@@ -16,6 +16,7 @@ INSTALLED_APPS = [
     "users",
     "resumes",
     "analysis",
+    "courses",
     "embeddings",
     "common",
 ]

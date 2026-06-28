@@ -103,3 +103,4 @@ uuid-utils==0.16.2
 websockets==15.0.1
 xxhash==3.7.0
 zstandard==0.25.0
+boto3==1.38.33
