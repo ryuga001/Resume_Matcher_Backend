@@ -10,29 +10,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_DB: sahara_test
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     env:
+      DJANGO_SETTINGS_MODULE: config.test_settings
       DJANGO_SECRET_KEY: ci-secret-key-not-for-production
-      POSTGRES_DB: sahara_test
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_HOST: localhost
-      POSTGRES_PORT: "5432"
-      PGUSER: postgres          # libpq fallback — prevents "role root does not exist"
+      JWT_SECRET: ci-jwt-secret-not-for-production
       DEBUG: "False"
 
     steps:
@@ -51,9 +32,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # GPU-only packages (CUDA, Triton, pinned torch) don't install on
-          # CPU-only CI runners. Strip them; torch resolves as CPU-only via
-          # sentence-transformers' dependency resolution.
           grep -vE "^(cuda-|nvidia-|triton==|torch==)" requirements.txt \
             > /tmp/requirements-ci.txt
           uv pip install --system \
@@ -61,17 +39,8 @@ jobs:
             --extra-index-url https://download.pytorch.org/whl/cpu \
             -r /tmp/requirements-ci.txt
 
-      - name: Wait for Postgres
-        run: |
-          for i in $(seq 1 30); do
-            pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" \
-              && echo "Postgres ready" && break
-            echo "Waiting for Postgres… ($i/30)"
-            sleep 2
-          done
-
-      - name: Run migrations
-        run: python manage.py migrate --no-input
+      - name: Verify build
+        run: python manage.py check
 
       - name: Run tests
         run: python manage.py test --no-input
