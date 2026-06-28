@@ -1,113 +1,143 @@
-from datetime import datetime, timezone
-from bson import ObjectId
-from common.mongodb.client import MongoDBClient
+from __future__ import annotations
+
+from django.db import transaction
+
+from courses.models import Course, Subtopic
 
 VALID_STATUSES = ("Not Available", "Available")
 
 
 class CourseRepository:
-    def __init__(self):
-        self.db = MongoDBClient.get_db()
-        self.collection = self.db["courses"]
-        self.collection.create_index("topic")
-        self.collection.create_index("categories")
-        self.collection.create_index("status")
+    """Data-access layer for Course and Subtopic. Returns plain dicts throughout."""
 
-    def _serialize(self, doc: dict) -> dict:
-        doc["id"] = str(doc.pop("_id"))
-        return doc
+    # ── Courses ───────────────────────────────────────────────────────────────
 
-    def list_courses(self, search: str = "", category: str = "", status: str = "") -> list:
-        query: dict = {}
+    def list_courses(self, search: str = "", category: str = "", status: str = "") -> list[dict]:
+        qs = Course.objects.prefetch_related("subtopics").order_by("-created_at")
         if search:
-            query["topic"] = {"$regex": search, "$options": "i"}
+            qs = qs.filter(topic__icontains=search)
         if category:
-            query["categories"] = category
+            qs = qs.filter(categories__contains=[category])
         if status:
-            query["status"] = status
-        docs = self.collection.find(query).sort("createdAt", -1)
-        return [self._serialize(d) for d in docs]
+            qs = qs.filter(status=status)
+        return [self._serialize_course(c) for c in qs]
 
-    def get_by_id(self, course_id: str) -> dict | None:
-        doc = self.collection.find_one({"_id": ObjectId(course_id)})
-        return self._serialize(doc) if doc else None
+    def get_by_id(self, course_id) -> dict | None:
+        try:
+            c = Course.objects.prefetch_related("subtopics").get(id=int(course_id))
+            return self._serialize_course(c)
+        except (Course.DoesNotExist, ValueError, TypeError):
+            return None
 
-    def create(self, topic: str, categories: list, status: str, thumbnail_key: str, source_file_key: str) -> dict:
+    def create(
+        self,
+        topic: str,
+        categories: list,
+        status: str,
+        thumbnail_key: str,
+        source_file_key: str,
+    ) -> dict:
         if status not in VALID_STATUSES:
             raise ValueError(f"Invalid status: {status}")
-        now = datetime.now(timezone.utc).isoformat()
-        doc = {
-            "topic": topic,
-            "categories": categories,
-            "status": status,
-            "thumbnailKey": thumbnail_key,
-            "sourceFileKey": source_file_key,
-            "createdAt": now,
-            "updatedAt": now,
-        }
-        result = self.collection.insert_one(doc)
-        doc["id"] = str(result.inserted_id)
-        doc.pop("_id", None)
-        return doc
+        c = Course.objects.create(
+            topic=topic,
+            categories=categories,
+            status=status,
+            thumbnail_key=thumbnail_key,
+            source_file_key=source_file_key,
+        )
+        return self._serialize_course(c)
 
-    def update(self, course_id: str, updates: dict) -> dict | None:
+    def update(self, course_id, updates: dict) -> dict | None:
+        field_map = {
+            "topic":         "topic",
+            "categories":    "categories",
+            "status":        "status",
+            "thumbnailKey":  "thumbnail_key",
+            "sourceFileKey": "source_file_key",
+        }
         if "status" in updates and updates["status"] not in VALID_STATUSES:
             raise ValueError(f"Invalid status: {updates['status']}")
-        updates["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        result = self.collection.find_one_and_update(
-            {"_id": ObjectId(course_id)},
-            {"$set": updates},
-            return_document=True,
-        )
-        return self._serialize(result) if result else None
+        orm_updates = {field_map[k]: v for k, v in updates.items() if k in field_map}
+        if not orm_updates:
+            return self.get_by_id(course_id)
+        Course.objects.filter(id=int(course_id)).update(**orm_updates)
+        return self.get_by_id(course_id)
 
-    def save_subtopics(self, course_id: str, subtopics: list) -> dict | None:
-        # Preserve any existing contentKey/status when re-saving subtopics
-        existing = self.get_by_id(course_id)
-        existing_map: dict = {}
-        if existing:
-            for s in existing.get("subtopics", []):
-                existing_map[s["order"]] = {
-                    "status":     s.get("status", "pending"),
-                    "contentKey": s.get("contentKey", ""),
-                }
+    def delete(self, course_id) -> bool:
+        deleted, _ = Course.objects.filter(id=int(course_id)).delete()
+        return deleted > 0
 
-        enriched = []
-        for s in subtopics:
-            prev = existing_map.get(s["order"], {})
-            enriched.append({
-                **s,
-                "status":     prev.get("status", "pending"),
-                "contentKey": prev.get("contentKey", ""),
-            })
+    # ── Subtopics ─────────────────────────────────────────────────────────────
 
-        result = self.collection.find_one_and_update(
-            {"_id": ObjectId(course_id)},
-            {"$set": {"subtopics": enriched, "updatedAt": datetime.now(timezone.utc).isoformat()}},
-            return_document=True,
-        )
-        return self._serialize(result) if result else None
-
-    def update_subtopic_field(self, course_id: str, order: int, fields: dict) -> bool:
-        """Update specific fields on a single subtopic identified by its order number."""
-        set_payload = {f"subtopics.$.{k}": v for k, v in fields.items()}
-        set_payload["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        result = self.collection.update_one(
-            {"_id": ObjectId(course_id), "subtopics.order": order},
-            {"$set": set_payload},
-        )
-        return result.modified_count > 0
-
-    def get_subtopic(self, course_id: str, order: int) -> dict | None:
-        """Return a single subtopic dict by order number."""
-        course = self.get_by_id(course_id)
-        if not course:
+    def save_subtopics(self, course_id, subtopics: list) -> dict | None:
+        try:
+            course = Course.objects.prefetch_related("subtopics").get(id=int(course_id))
+        except (Course.DoesNotExist, ValueError, TypeError):
             return None
-        for s in course.get("subtopics", []):
-            if s.get("order") == order:
-                return s
-        return None
 
-    def delete(self, course_id: str) -> bool:
-        result = self.collection.delete_one({"_id": ObjectId(course_id)})
-        return result.deleted_count > 0
+        existing = {s.order: s for s in course.subtopics.all()}
+
+        with transaction.atomic():
+            course.subtopics.all().delete()
+            Subtopic.objects.bulk_create([
+                Subtopic(
+                    course=course,
+                    title=s["title"],
+                    difficulty=s.get("difficulty", "Intermediate"),
+                    order=s["order"],
+                    status=existing[s["order"]].status if s["order"] in existing else "pending",
+                    content_key=existing[s["order"]].content_key if s["order"] in existing else "",
+                )
+                for s in subtopics
+            ])
+
+        return self.get_by_id(course_id)
+
+    def update_subtopic_field(self, course_id, order: int, fields: dict) -> bool:
+        field_map = {"status": "status", "contentKey": "content_key"}
+        orm_fields = {field_map.get(k, k): v for k, v in fields.items()}
+        updated = Subtopic.objects.filter(course_id=int(course_id), order=order).update(**orm_fields)
+        return updated > 0
+
+    def get_subtopic(self, course_id, order: int) -> dict | None:
+        try:
+            s = Subtopic.objects.get(course_id=int(course_id), order=order)
+            return self._serialize_subtopic(s)
+        except (Subtopic.DoesNotExist, ValueError, TypeError):
+            return None
+
+    def get_content_statuses(self, course_id) -> list[dict]:
+        return [
+            {"order": s.order, "status": s.status}
+            for s in Subtopic.objects.filter(course_id=int(course_id)).only("order", "status")
+        ]
+
+    # ── Serialisation ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _serialize_course(c: Course) -> dict:
+        return {
+            "id":            str(c.id),
+            "topic":         c.topic,
+            "categories":    c.categories,
+            "status":        c.status,
+            "thumbnailKey":  c.thumbnail_key,
+            "sourceFileKey": c.source_file_key,
+            "createdAt":     c.created_at.isoformat(),
+            "updatedAt":     c.updated_at.isoformat(),
+            "subtopics": [
+                CourseRepository._serialize_subtopic(s)
+                for s in c.subtopics.all()
+            ],
+        }
+
+    @staticmethod
+    def _serialize_subtopic(s: Subtopic) -> dict:
+        return {
+            "title":      s.title,
+            "difficulty": s.difficulty,
+            "order":      s.order,
+            "status":     s.status,
+            "contentKey": s.content_key,
+        }

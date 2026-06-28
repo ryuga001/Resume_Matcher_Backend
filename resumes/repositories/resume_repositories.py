@@ -1,34 +1,50 @@
-from bson import ObjectId
-from common.mongodb.client import MongoDBClient
+from __future__ import annotations
+
+from resumes.models import Resume
 
 
 class ResumeRepository:
-    def __init__(self):
-        self.db = MongoDBClient.get_db()
-        self.collection = self.db["resumes"]
+    """Data-access layer for Resume."""
 
-    def save_resume(self, resume_data: dict) -> str:
-        result = self.collection.insert_one(resume_data)
-        return str(result.inserted_id)
-
-    def get_resume_by_id(self, resume_id: str, user_id: str = None):
-        query = {"_id": ObjectId(resume_id)}
-        if user_id:
-            query["userId"] = user_id
-        return self.collection.find_one(query)
-
-    def get_all_resumes(self, user_id: str):
-        return list(self.collection.find(
-            {"userId": user_id},
-            {"_id": 1, "fileName": 1, "uploadedAt": 1, "indexStatus": 1, "skills": 1}
-        ))
-
-    def set_index_status(self, resume_id: str, status: str):
-        self.collection.update_one(
-            {"_id": ObjectId(resume_id)},
-            {"$set": {"indexStatus": status}}
+    def save_resume(self, data: dict) -> str:
+        resume = Resume.objects.create(
+            user_id=int(data["userId"]),
+            file_name=data["fileName"],
+            resume_text=data.get("resumeText", ""),
+            skills=data.get("skills", []),
+            index_status="processing",
         )
+        return str(resume.id)
+
+    def get_resume_by_id(self, resume_id: str, user_id: str | None = None) -> dict | None:
+        try:
+            qs = Resume.objects.filter(id=int(resume_id))
+            if user_id is not None:
+                qs = qs.filter(user_id=int(user_id))
+            r = qs.first()
+            return self._serialize(r) if r else None
+        except (ValueError, TypeError):
+            return None
+
+    def get_all_resumes(self, user_id: str) -> list[dict]:
+        return [self._serialize(r) for r in Resume.objects.filter(user_id=int(user_id))]
+
+    def set_index_status(self, resume_id: str, status: str) -> None:
+        Resume.objects.filter(id=int(resume_id)).update(index_status=status)
 
     def delete_resume(self, resume_id: str, user_id: str) -> bool:
-        result = self.collection.delete_one({"_id": ObjectId(resume_id), "userId": user_id})
-        return result.deleted_count > 0
+        deleted, _ = Resume.objects.filter(id=int(resume_id), user_id=int(user_id)).delete()
+        return deleted > 0
+
+    @staticmethod
+    def _serialize(r: Resume) -> dict:
+        return {
+            "_id":         str(r.id),
+            "resumeId":    str(r.id),
+            "userId":      str(r.user_id),
+            "fileName":    r.file_name,
+            "resumeText":  r.resume_text,
+            "skills":      r.skills,
+            "uploadedAt":  r.uploaded_at,
+            "indexStatus": r.index_status,
+        }

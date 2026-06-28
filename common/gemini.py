@@ -2,7 +2,8 @@ import json
 import os
 import uuid
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from common.s3 import S3Service
 
@@ -86,15 +87,14 @@ Rules:
 
 class GeminiService:
     def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(os.getenv("GEMINI_MODEL"))
-        self._s3    = S3Service()
+        self._client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", ""))
+        self._model  = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self._s3     = S3Service()
 
     def generate_subtopics(self, source_key: str, topic: str) -> list[dict]:
         """
         Stream the S3 source file, extract text without loading the full file
-        into memory, feed it to Gemini Flash, and return a parsed subtopics list.
+        into memory, feed it to Gemini, and return a parsed subtopics list.
 
         Raises:
             ValueError  — unsupported file type or empty content.
@@ -112,8 +112,11 @@ class GeminiService:
         prompt  = _SUBTOPIC_PROMPT.format(topic=topic, content=content)
 
         try:
-            response = self._model.generate_content(prompt)
-            raw      = response.text.strip()
+            response = self._client.models.generate_content(
+                model=self._model,
+                contents=prompt,
+            )
+            raw = response.text.strip()
         except Exception as exc:
             raise RuntimeError(f"Gemini call failed: {exc}") from exc
 
@@ -176,9 +179,10 @@ class GeminiService:
         )
 
         try:
-            response = self._model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(max_output_tokens=8192),
+            response = self._client.models.generate_content(
+                model=self._model,
+                contents=prompt,
+                config=types.GenerateContentConfig(max_output_tokens=8192),
             )
             raw = response.text.strip()
         except Exception as exc:
@@ -224,17 +228,24 @@ class GeminiService:
         )
 
         gemini_history = [
-            {"role": h["role"], "parts": [h["content"]]}
+            types.Content(
+                role=h["role"],
+                parts=[types.Part(text=h["content"])],
+            )
             for h in history
             if h.get("role") in ("user", "model") and h.get("content")
         ]
 
-        chat = self._model.start_chat(history=gemini_history)
+        chat = self._client.chats.create(
+            model=self._model,
+            history=gemini_history,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=1024,
+            ),
+        )
         try:
-            response = chat.send_message(
-                f"{system_prompt}\n\nStudent question: {message}",
-                generation_config=genai.GenerationConfig(max_output_tokens=1024),
-            )
+            response = chat.send_message(message)
             return response.text.strip()
         except Exception as exc:
             raise RuntimeError(f"Gemini chat failed: {exc}") from exc

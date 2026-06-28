@@ -1,36 +1,49 @@
-from common.mongodb.client import MongoDBClient
+from __future__ import annotations
+
+import numpy as np
+from pgvector.django import CosineDistance
+
+from embeddings.models import ResumeChunk
 
 
 class EmbeddingRepository:
-    def __init__(self):
-        self.collection = MongoDBClient.get_db()["resume_chunks"]
+    """pgvector-backed repository for resume chunk embeddings."""
 
-    def save_many(self, documents: list):
-        self.collection.insert_many(documents)
-
-    def find_by_resume_id(self, resume_id: str):
-        return list(self.collection.find({"resumeId": resume_id}, {"_id": 0}))
-
-    def vector_search(self, resume_id: str, query_embedding: list, limit: int = 5):
-        pipeline = [
-            {
-                "$vectorSearch": {
-                    "index": "resume_vector_index",
-                    "path": "embedding",
-                    "queryVector": query_embedding,
-                    "numCandidates": 100,
-                    "limit": limit,
-                    "filter": {"resumeId": resume_id},
-                }
-            },
-            {
-                "$project": {
-                    "_id": 0,
-                    "resumeId": 1,
-                    "chunkIndex": 1,
-                    "text": 1,
-                    "score": {"$meta": "vectorSearchScore"},
-                }
-            },
+    def save_many(self, documents: list[dict]) -> None:
+        chunks = [
+            ResumeChunk(
+                resume_id=int(doc["resumeId"]),
+                chunk_index=doc["chunkIndex"],
+                text=doc["text"],
+                embedding=doc["embedding"],
+            )
+            for doc in documents
         ]
-        return list(self.collection.aggregate(pipeline))
+        ResumeChunk.objects.bulk_create(chunks)
+
+    def find_by_resume_id(self, resume_id: str) -> list[dict]:
+        rows = ResumeChunk.objects.filter(resume_id=int(resume_id))
+        return [
+            {
+                "resumeId":   resume_id,
+                "chunkIndex": r.chunk_index,
+                "text":       r.text,
+                "embedding":  list(r.embedding),
+            }
+            for r in rows
+        ]
+
+    def vector_search(self, resume_id: str, query_embedding: list[float], limit: int = 5) -> list[dict]:
+        rows = (
+            ResumeChunk.objects
+            .filter(resume_id=int(resume_id))
+            .annotate(distance=CosineDistance("embedding", query_embedding))
+            .order_by("distance")[:limit]
+        )
+        return [
+            {"text": r.text, "score": float(1 - r.distance), "chunkIndex": r.chunk_index}
+            for r in rows
+        ]
+
+    def delete_by_resume(self, resume_id: str) -> None:
+        ResumeChunk.objects.filter(resume_id=int(resume_id)).delete()

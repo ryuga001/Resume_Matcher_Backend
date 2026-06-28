@@ -1,5 +1,4 @@
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 
 from resumes.services.resume_parser_service import ResumeParserService
@@ -11,44 +10,40 @@ UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads" / "resume
 
 
 class ResumeService:
-    def __init__(self):
-        self.repository = ResumeRepository()
+    """Orchestrates resume upload: parse → extract skills → persist → async index."""
+
+    def __init__(self) -> None:
+        self._repository = ResumeRepository()
 
     def process_resume(self, uploaded_file, user_id: str) -> str:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         path = UPLOAD_DIR / uploaded_file.name
 
-        with open(path, "wb+") as destination:
+        with open(path, "wb+") as fh:
             for chunk in uploaded_file.chunks():
-                destination.write(chunk)
+                fh.write(chunk)
 
         content = ResumeParserService.extract_text_from_pdf(path)
-        skills = SkillExtrationService.extract(content)
+        skills  = SkillExtrationService.extract(content)
 
-        document = {
-            "userId": user_id,
-            "fileName": uploaded_file.name,
+        resume_id = self._repository.save_resume({
+            "userId":    user_id,
+            "fileName":  uploaded_file.name,
             "resumeText": content,
-            "skills": skills,
-            "uploadedAt": datetime.now(timezone.utc),
-            "indexStatus": "processing",
-        }
+            "skills":    skills,
+        })
 
-        resume_id = self.repository.save_resume(document)
-
-        # Index in background thread so upload returns fast
-        thread = threading.Thread(
+        threading.Thread(
             target=self._index_async,
             args=(resume_id, content),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
         return resume_id
 
-    def _index_async(self, resume_id: str, content: str):
+    def _index_async(self, resume_id: str, content: str) -> None:
         try:
             IndexingService().index_resume(resume_id, content)
-            self.repository.set_index_status(resume_id, "ready")
+            self._repository.set_index_status(resume_id, "ready")
         except Exception:
-            self.repository.set_index_status(resume_id, "error")
+            self._repository.set_index_status(resume_id, "error")

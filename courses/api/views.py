@@ -1,12 +1,15 @@
 import json
+import uuid
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from common.s3 import S3Service
 from common.gemini import GeminiService
+from common.rabbitmq import publish
 from users.auth import require_auth, require_role
 from courses.repository import CourseRepository, VALID_STATUSES
+from courses.models import TaskRecord
 
 s3 = S3Service()
 
@@ -27,14 +30,10 @@ class PresignView(APIView):
 
         if upload_type not in ("source", "thumbnail"):
             return Response({"error": "uploadType must be 'source' or 'thumbnail'."}, status=400)
-
         try:
             result = s3.presign_put(filename, content_type, f"courses/{upload_type}")
-        except ValueError as exc:
-            return Response({"error": str(exc)}, status=400)
-        except RuntimeError as exc:
-            return Response({"error": str(exc)}, status=500)
-
+        except (ValueError, RuntimeError) as exc:
+            return Response({"error": str(exc)}, status=400 if isinstance(exc, ValueError) else 500)
         return Response(result)
 
 
@@ -44,8 +43,7 @@ class CourseListView(APIView):
         search   = request.query_params.get("search",   "")
         category = request.query_params.get("category", "")
         status   = request.query_params.get("status",   "")
-        courses  = CourseRepository().list_courses(search=search, category=category, status=status)
-        return Response([_enrich(c) for c in courses])
+        return Response([_enrich(c) for c in CourseRepository().list_courses(search=search, category=category, status=status)])
 
     @require_role("SUPER_ADMIN")
     def post(self, request):
@@ -61,7 +59,6 @@ class CourseListView(APIView):
             return Response({"error": "categories must be an array."}, status=400)
         if status not in VALID_STATUSES:
             return Response({"error": f"status must be one of {VALID_STATUSES}."}, status=400)
-
         try:
             course = CourseRepository().create(topic, categories, status, thumbnail_key, source_file_key)
             return Response(_enrich(course), status=201)
@@ -81,10 +78,8 @@ class CourseDetailView(APIView):
     def patch(self, request, course_id):
         allowed = {"topic", "categories", "status", "thumbnailKey", "sourceFileKey"}
         updates = {k: v for k, v in request.data.items() if k in allowed}
-
         if not updates:
             return Response({"error": "No valid fields to update."}, status=400)
-
         try:
             course = CourseRepository().update(course_id, updates)
             if not course:
@@ -95,64 +90,57 @@ class CourseDetailView(APIView):
 
     @require_role("SUPER_ADMIN")
     def delete(self, request, course_id):
-
         repo   = CourseRepository()
         course = repo.get_by_id(course_id)
         if not course:
             return Response({"error": "Course not found."}, status=404)
-
-        # Collect keys before deleting the DB record
-        keys = [
-            course.get("thumbnailKey")  or course.get("thumbnailUrl",  ""),
-            course.get("sourceFileKey") or course.get("sourceFileUrl", ""),
-        ]
-
+        keys = [course.get("thumbnailKey", ""), course.get("sourceFileKey", "")]
         repo.delete(course_id)
         s3.delete_many(keys)
-
         return Response({"ok": True})
 
 
 class SubtopicsGenerateView(APIView):
-    """POST — enqueue async subtopic generation, return taskId immediately."""
+    """POST — enqueue async subtopic generation via RabbitMQ, return taskId."""
 
     @require_role("SUPER_ADMIN")
     def post(self, request, course_id):
-        from courses.tasks import generate_subtopics_task
-
         course = CourseRepository().get_by_id(course_id)
         if not course:
             return Response({"error": "Course not found."}, status=404)
-
-        source_key = course.get("sourceFileKey", "")
-        if not source_key:
+        if not course.get("sourceFileKey"):
             return Response({"error": "This course has no source file."}, status=400)
 
-        result = generate_subtopics_task.delay(course_id)
-        return Response({"taskId": result.id})
+        task_id = str(uuid.uuid4())
+        record = TaskRecord.objects.create(task_id=task_id, task_type="subtopics", course_id=int(course_id))
+        try:
+            publish("subtopics_generation", {"task_id": task_id, "course_id": str(course_id)})
+        except Exception as exc:
+            record.delete()
+            return Response({"error": f"Message broker unavailable: {exc}"}, status=503)
+        return Response({"taskId": task_id})
 
 
 class SubtopicsTaskStatusView(APIView):
-    """GET — poll Celery task result for subtopic generation."""
+    """GET — poll task record for subtopic generation progress."""
 
     @require_role("SUPER_ADMIN")
     def get(self, request, course_id, task_id):
-        from celery.result import AsyncResult
-        result = AsyncResult(task_id)
+        try:
+            record = TaskRecord.objects.get(task_id=task_id)
+        except TaskRecord.DoesNotExist:
+            # Always 200 so RTK Query routes the body to `data`, not `error`
+            return Response({"status": "error", "error": "Task not found."})
 
-        if result.state == "SUCCESS":
-            return Response({"status": "done", "subtopics": result.result})
-
-        if result.state == "FAILURE":
-            err = str(result.result) if result.result else "Generation failed."
-            err = err.splitlines()[0]
-            return Response({"status": "error", "error": err})
-
+        if record.status == "done":
+            return Response({"status": "done", "subtopics": record.result})
+        if record.status == "error":
+            return Response({"status": "error", "error": record.error_message or "Generation failed."})
         return Response({"status": "running"})
 
 
 class SubtopicsView(APIView):
-    """PUT — save the (possibly edited) subtopics list to MongoDB."""
+    """PUT — save the edited subtopics list."""
 
     @require_role("SUPER_ADMIN")
     def put(self, request, course_id):
@@ -160,7 +148,6 @@ class SubtopicsView(APIView):
         if not isinstance(subtopics, list):
             return Response({"error": "subtopics must be an array."}, status=400)
 
-        # Normalise & re-number
         valid_difficulties = {"Beginner", "Intermediate", "Advanced"}
         cleaned = []
         for i, s in enumerate(subtopics):
@@ -175,27 +162,28 @@ class SubtopicsView(APIView):
         course = CourseRepository().save_subtopics(course_id, cleaned)
         if not course:
             return Response({"error": "Course not found."}, status=404)
-
         return Response({"subtopics": course.get("subtopics", [])})
 
 
 class ContentGenerateView(APIView):
-    """POST — enqueue Celery tasks to generate content for all subtopics."""
+    """POST — enqueue bulk content generation for all subtopics."""
 
     @require_role("SUPER_ADMIN")
     def post(self, request, course_id):
-        from courses.tasks import generate_course_content
         course = CourseRepository().get_by_id(course_id)
         if not course:
             return Response({"error": "Course not found."}, status=404)
         if not course.get("subtopics"):
             return Response({"error": "No subtopics — generate subtopics first."}, status=400)
-        result = generate_course_content.delay(course_id)
-        return Response({"taskId": result.id, "queued": True})
+        try:
+            publish("bulk_content_generation", {"course_id": str(course_id)})
+        except Exception as exc:
+            return Response({"error": f"Message broker unavailable: {exc}"}, status=503)
+        return Response({"queued": True})
 
 
 class ContentStatusView(APIView):
-    """GET — return subtopic-level generation statuses."""
+    """GET — return per-subtopic generation statuses."""
 
     @require_auth
     def get(self, request, course_id):
@@ -210,41 +198,40 @@ class ContentStatusView(APIView):
 
 
 class SubtopicContentView(APIView):
-    """GET — fetch generated content JSON. PUT — admin saves edited content."""
+    """GET — fetch content JSON. POST — enqueue single-subtopic gen. PUT — save edits."""
 
     @require_auth
     def get(self, request, course_id, order):
-        order = int(order)
-        subtopic = CourseRepository().get_subtopic(course_id, order)
+        repo     = CourseRepository()
+        subtopic = repo.get_subtopic(course_id, order)
         if not subtopic:
             return Response({"error": "Subtopic not found."}, status=404)
         content_key = subtopic.get("contentKey", "")
         if not content_key or subtopic.get("status") != "done":
             return Response({"error": "Content not yet generated."}, status=404)
         try:
-            raw = s3.get_text(content_key)
-            content = json.loads(raw)
+            content = json.loads(s3.get_text(content_key))
         except Exception:
             return Response({"error": "Could not load content from storage."}, status=500)
         return Response({"content": content, "subtopic": subtopic})
 
     @require_role("SUPER_ADMIN")
     def post(self, request, course_id, order):
-        """Enqueue generation for a single subtopic."""
-        from courses.tasks import generate_subtopic_content_task
-        order = int(order)
-        repo = CourseRepository()
+        repo     = CourseRepository()
         subtopic = repo.get_subtopic(course_id, order)
         if not subtopic:
             return Response({"error": "Subtopic not found."}, status=404)
-        # Mark synchronously so the UI sees "generating" on the next poll
+        # Mark generating synchronously so the next poll shows the right status
         repo.update_subtopic_field(course_id, order, {"status": "generating", "contentKey": ""})
-        generate_subtopic_content_task.delay(course_id, order)
+        try:
+            publish("content_generation", {"course_id": str(course_id), "order": order})
+        except Exception as exc:
+            repo.update_subtopic_field(course_id, order, {"status": "error"})
+            return Response({"error": f"Message broker unavailable: {exc}"}, status=503)
         return Response({"queued": True})
 
     @require_role("SUPER_ADMIN")
     def put(self, request, course_id, order):
-        order = int(order)
         content = request.data.get("content")
         if not isinstance(content, dict):
             return Response({"error": "content must be a JSON object."}, status=400)
@@ -262,13 +249,11 @@ class SubtopicContentView(APIView):
         except Exception as exc:
             return Response({"error": f"Could not save content: {exc}"}, status=500)
 
-        # Re-embed updated content
-        from common.embeddings import EmbeddingService
-        from common.mongodb.client import MongoDBClient
         try:
-            EmbeddingService().index_content(MongoDBClient.get_db(), course_id, order, content)
+            from common.embeddings import EmbeddingService
+            EmbeddingService().index_content(str(course_id), order, content)
         except Exception:
-            pass  # Don't fail the save if re-embedding fails
+            pass
 
         return Response({"ok": True})
 
@@ -280,12 +265,11 @@ class SubtopicChatView(APIView):
     def post(self, request, course_id, order):
         message = request.data.get("message", "").strip()
         history = request.data.get("history", [])
-
         if not message:
             return Response({"error": "message is required."}, status=400)
 
-        repo   = CourseRepository()
-        course = repo.get_by_id(course_id)
+        repo     = CourseRepository()
+        course   = repo.get_by_id(course_id)
         if not course:
             return Response({"error": "Course not found."}, status=404)
 
@@ -297,31 +281,29 @@ class SubtopicChatView(APIView):
         if not content_key:
             return Response({"error": "Content not generated yet for this subtopic."}, status=400)
 
-        # Load content from S3 and build context text
         try:
-            raw     = s3.get_text(content_key)
-            content = json.loads(raw)
+            content = json.loads(s3.get_text(content_key))
         except Exception:
             return Response({"error": "Could not load subtopic content."}, status=500)
 
-        context_parts: list[str] = []
-        if overview := content.get("overview"):
-            context_parts.append(f"Overview:\n{overview}")
+        # Build full-content context as fallback
+        parts: list[str] = []
+        if ov := content.get("overview"):
+            parts.append(f"Overview:\n{ov}")
         for t in content.get("theory", []):
-            context_parts.append(f"{t.get('heading', '')}:\n{t.get('body', '')}")
+            parts.append(f"{t.get('heading', '')}:\n{t.get('body', '')}")
         if kp := content.get("key_points"):
-            context_parts.append("Key Points:\n" + "\n".join(f"- {k}" for k in kp))
-        context_text = "\n\n".join(context_parts)
+            parts.append("Key Points:\n" + "\n".join(f"- {k}" for k in kp))
+        context_text = "\n\n".join(parts)
 
-        # Narrow context via RAG if embeddings exist
+        # Narrow via pgvector RAG if embeddings exist
         try:
             from common.embeddings import EmbeddingService
-            from common.mongodb.client import MongoDBClient
-            chunks = EmbeddingService().search(MongoDBClient.get_db(), course_id, message, top_k=5)
+            chunks = EmbeddingService().search(str(course_id), message, top_k=5)
             if chunks:
                 context_text = "\n\n---\n\n".join(c["text"] for c in chunks)
         except Exception:
-            pass  # Fall back to full content context
+            pass
 
         try:
             reply = GeminiService().chat_subtopic(
