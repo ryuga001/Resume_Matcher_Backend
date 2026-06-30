@@ -12,6 +12,7 @@ class ResumeRepository:
             file_name=data["fileName"],
             resume_text=data.get("resumeText", ""),
             skills=data.get("skills", []),
+            s3_key=data.get("s3Key", ""),
             index_status="processing",
         )
         return str(resume.id)
@@ -32,9 +33,15 @@ class ResumeRepository:
     def set_index_status(self, resume_id: str, status: str) -> None:
         Resume.objects.filter(id=int(resume_id)).update(index_status=status)
 
-    def delete_resume(self, resume_id: str, user_id: str) -> bool:
-        deleted, _ = Resume.objects.filter(id=int(resume_id), user_id=int(user_id)).delete()
-        return deleted > 0
+    def delete_resume(self, resume_id: str, user_id: str) -> str | None:
+        """Delete the record and return the s3_key (if any) so the caller can clean S3."""
+        try:
+            resume = Resume.objects.get(id=int(resume_id), user_id=int(user_id))
+        except Resume.DoesNotExist:
+            return None
+        s3_key = resume.s3_key or ""
+        resume.delete()
+        return s3_key
 
     @staticmethod
     def _serialize(r: Resume) -> dict:
@@ -45,6 +52,7 @@ class ResumeRepository:
             "fileName":    r.file_name,
             "resumeText":  r.resume_text,
             "skills":      r.skills,
+            "s3Key":       r.s3_key,
             "uploadedAt":  r.uploaded_at,
             "indexStatus": r.index_status,
         }

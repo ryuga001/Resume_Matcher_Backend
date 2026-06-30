@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from users.auth import require_auth
 from resumes.services.resume_service import ResumeService
 from resumes.repositories.resume_repositories import ResumeRepository
+from common.s3 import S3Service
 
 
 class ResumeUploadView(APIView):
@@ -24,11 +25,11 @@ class ResumeListView(APIView):
         resumes = ResumeRepository().get_all_resumes(request.user_id)
         return Response([
             {
-                "resumeId": str(r["_id"]),
-                "fileName": r.get("fileName", "Unnamed"),
-                "uploadedAt": r["uploadedAt"].isoformat() if r.get("uploadedAt") else None,
+                "resumeId":    str(r["_id"]),
+                "fileName":    r.get("fileName", "Unnamed"),
+                "uploadedAt":  r["uploadedAt"].isoformat() if r.get("uploadedAt") else None,
                 "indexStatus": r.get("indexStatus", "ready"),
-                "skills": r.get("skills", []),
+                "skills":      r.get("skills", []),
             }
             for r in resumes
         ])
@@ -37,7 +38,9 @@ class ResumeListView(APIView):
 class ResumeDeleteView(APIView):
     @require_auth
     def delete(self, request, resume_id):
-        deleted = ResumeRepository().delete_resume(resume_id, request.user_id)
-        if not deleted:
+        s3_key = ResumeRepository().delete_resume(resume_id, request.user_id)
+        if s3_key is None:
             return Response({"error": "Resume not found."}, status=404)
+        if s3_key:
+            S3Service().delete(s3_key)
         return Response({"success": True})

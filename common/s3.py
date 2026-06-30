@@ -131,6 +131,16 @@ class S3Service:
         except (BotoCoreError, ClientError):
             pass
 
+    def upload_file(self, local_path: str, key: str, content_type: str = "application/octet-stream") -> None:
+        """Upload a local file to S3."""
+        with open(local_path, "rb") as fh:
+            self._client().put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=fh,
+                ContentType=content_type,
+            )
+
     # ── Text helpers ──────────────────────────────────────────────────────────
 
     def put_text(self, key: str, text: str, content_type: str = "text/markdown; charset=utf-8") -> None:

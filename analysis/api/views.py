@@ -25,8 +25,8 @@ class ResumeAnalysisView(APIView):
         if not resume:
             return Response({"error": "Resume not found."}, status=404)
 
-        remaining = user_repo.decrement_uses(request.user_id)
         result    = AnalysisService().analyze(resume_id, job_description)
+        remaining = user_repo.decrement_uses(request.user_id)
 
         AnalysisRepository().save(
             user_id=request.user_id,

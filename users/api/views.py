@@ -8,11 +8,12 @@ from users.auth import require_auth
 from users.repository import UserRepository
 
 _SECURE_COOKIES = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+_SAMESITE = "None" if _SECURE_COOKIES else "Lax"
 
 
 def _set_auth_cookies(response, access_token: str, refresh_token: str) -> None:
-    response.set_cookie("rm_access_token",  access_token,  max_age=15 * 60,      httponly=True, samesite="Lax", secure=_SECURE_COOKIES, path="/")
-    response.set_cookie("rm_refresh_token", refresh_token, max_age=7 * 24 * 3600, httponly=True, samesite="Lax", secure=_SECURE_COOKIES, path="/")
+    response.set_cookie("rm_access_token",  access_token,  max_age=15 * 60,       httponly=True, samesite=_SAMESITE, secure=_SECURE_COOKIES, path="/")
+    response.set_cookie("rm_refresh_token", refresh_token, max_age=7 * 24 * 3600, httponly=True, samesite=_SAMESITE, secure=_SECURE_COOKIES, path="/")
 
 
 def _clear_auth_cookies(response) -> None:
@@ -79,7 +80,7 @@ class RefreshView(APIView):
         new_access = svc.create_access_token(user_id, user["email"], user["name"], user["role"])
 
         response = Response({"user": {"id": user_id, "email": user["email"], "name": user["name"], "role": user["role"]}})
-        response.set_cookie("rm_access_token", new_access, max_age=15 * 60, httponly=True, samesite="Lax", secure=_SECURE_COOKIES, path="/")
+        response.set_cookie("rm_access_token", new_access, max_age=15 * 60, httponly=True, samesite=_SAMESITE, secure=_SECURE_COOKIES, path="/")
         return response
 
 
