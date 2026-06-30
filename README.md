@@ -12,10 +12,10 @@ Django REST API powering resume analysis, AI-driven ATS scoring, and the Sahara 
 | Database | PostgreSQL 16 + pgvector |
 | Task queue | RabbitMQ + pika — three dedicated worker processes |
 | AI / LLM | Google Gemini via `google-genai` SDK |
-| Resume embeddings | `sentence-transformers` — `all-MiniLM-L6-v2` (384-dim, local) |
+| Resume embeddings | `sentence-transformers` — `all-MiniLM-L6-v2` (384-dim, local, GPU-accelerated via PyTorch) |
 | Course embeddings | Gemini `text-embedding-004` (768-dim) |
-| Storage | AWS S3 (or any S3-compatible store via `S3_ENDPOINT_URL`) |
-| Auth | PyJWT — stateless Bearer tokens issued as HTTP-only cookies |
+| Storage | AWS S3 (or any S3-compatible store via `S3_ENDPOINT_URL`) — used for course PDFs/thumbnails and subtopic content JSON |
+| Auth | PyJWT — stateless Bearer tokens + HTTP-only cookies (access: 15 min, refresh: 7 days) |
 | PDF parsing | PyMuPDF (`fitz`) |
 | Package manager | uv |
 
@@ -27,10 +27,33 @@ Django REST API powering resume analysis, AI-driven ATS scoring, and the Sahara 
 backend/
 ├── config/
 │   ├── settings.py          # All config — env-driven
+│   ├── test_settings.py     # CI overrides (in-memory SQLite, no migrations)
 │   └── urls.py              # Root URL conf
 ├── users/                   # Auth: register, login, JWT, profile, refresh, logout
-├── resumes/                 # PDF upload → S3, text extraction, MiniLM embedding + index
+│   ├── api/
+│   │   ├── views.py
+│   │   └── urls.py
+│   ├── auth.py              # @require_auth / @require_role decorators
+│   ├── service.py           # AuthService — JWT issue/verify, password hashing
+│   ├── repository.py        # UserRepository — ORM queries, usesLeft tracking
+│   └── models.py
+├── resumes/                 # PDF upload → local storage, text extraction, embedding index
+│   ├── api/
+│   ├── services/
+│   │   ├── resume_service.py         # Orchestrator: parse → skills → save → async index
+│   │   ├── resume_parser_service.py  # PyMuPDF text extraction
+│   │   └── skill_extraction_service.py
+│   ├── repositories/
+│   └── models.py
 ├── analysis/                # ATS scoring, skill-gap analysis, history
+│   ├── api/
+│   │   ├── views.py
+│   │   └── urls.py
+│   ├── repository/
+│   │   └── analysis_repository.py
+│   ├── service/
+│   │   └── analysis_service.py
+│   └── models.py
 ├── courses/                 # Academy: courses, subtopics, content generation, RAG chat
 │   ├── api/
 │   │   ├── views.py         # All course API views
@@ -50,14 +73,18 @@ backend/
 │   ├── subtopic_worker.py   # Consumes 'subtopics_generation' queue
 │   ├── content_worker.py    # Consumes 'content_generation' queue
 │   └── bulk_content_worker.py  # Consumes 'bulk_content_generation' queue
+├── uploads/
+│   └── resumes/             # Local PDF storage for uploaded resumes
 └── manage.py
 ```
+
+> **Note:** `rag/` and `chat/` directories exist in the repo but are not registered in `INSTALLED_APPS` and have no URL routes. They are unused stubs.
 
 ---
 
 ## API Endpoints
 
-All routes except `register`, `login`, and `refresh` require `Authorization: Bearer <token>`.  
+All routes except `register`, `login`, `logout`, and `refresh` require a valid JWT — passed as the `rm_access_token` HTTP-only cookie or the `Authorization: Bearer <token>` header.  
 Admin routes additionally require `role == "SUPER_ADMIN"`.
 
 ### Auth — `/api/auth/`
@@ -65,10 +92,10 @@ Admin routes additionally require `role == "SUPER_ADMIN"`.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/api/auth/register` | — | Create account |
-| POST | `/api/auth/login` | — | Login, returns JWT (HTTP-only cookie + body) |
-| POST | `/api/auth/logout` | — | Clear auth cookie |
-| POST | `/api/auth/refresh` | — | Refresh access token |
-| GET | `/api/auth/me` | ✓ | Current user profile |
+| POST | `/api/auth/login` | — | Login — sets `rm_access_token` (15 min) and `rm_refresh_token` (7 days) cookies |
+| POST | `/api/auth/logout` | — | Clear auth cookies |
+| POST | `/api/auth/refresh` | — | Issue new access token from refresh cookie |
+| GET | `/api/auth/me` | ✓ | Current user profile + `usesLeft` credits |
 | PATCH | `/api/auth/profile` | ✓ | Update name / password |
 
 ### Resumes — `/api/resumes/`
@@ -76,14 +103,14 @@ Admin routes additionally require `role == "SUPER_ADMIN"`.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | `/api/resumes/list` | ✓ | List user's resumes |
-| POST | `/api/resumes/upload` | ✓ | Upload PDF, extract text, index embeddings |
-| DELETE | `/api/resumes/<id>` | ✓ | Delete resume + S3 asset |
+| POST | `/api/resumes/upload` | ✓ | Upload PDF, extract text + skills, async embedding index |
+| DELETE | `/api/resumes/<id>` | ✓ | Delete resume record |
 
 ### Analysis — `/api/analysis`
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/api/analysis` | ✓ | Run ATS analysis — returns score, skills, recommendations |
+| POST | `/api/analysis` | ✓ | Run ATS analysis — costs 1 credit (`usesLeft`), returns score, skills, recommendations |
 | GET | `/api/analysis/history` | ✓ | Full analysis history |
 | GET | `/api/analysis/<id>` | ✓ | Single analysis detail |
 
@@ -91,19 +118,19 @@ Admin routes additionally require `role == "SUPER_ADMIN"`.
 
 | Method | Path | Role | Description |
 |--------|------|------|-------------|
-| GET | `/api/courses` | any | List courses (search, category, status filters) |
+| GET | `/api/courses` | ✓ auth | List courses (search, category, status filters) |
 | POST | `/api/courses` | admin | Create course |
-| GET | `/api/courses/<id>` | any | Course detail |
+| GET | `/api/courses/<id>` | ✓ auth | Course detail |
 | PATCH | `/api/courses/<id>` | admin | Update course |
 | DELETE | `/api/courses/<id>` | admin | Delete course + S3 assets |
 | POST | `/api/courses/presign` | admin | Presign S3 PUT for source PDF / thumbnail |
 | POST | `/api/courses/<id>/subtopics/generate` | admin | Enqueue subtopic generation (returns `taskId`) |
 | GET | `/api/courses/<id>/subtopics/status/<taskId>` | admin | Poll subtopic task status |
-| PUT | `/api/courses/<id>/subtopics` | admin | Save / reorder subtopic list |
-| POST | `/api/courses/<id>/content/generate` | admin | Enqueue content generation for all subtopics |
-| GET | `/api/courses/<id>/content/status` | any | Per-subtopic generation status |
-| GET/POST/PUT | `/api/courses/<id>/content/<order>` | any/admin | Fetch / generate / save subtopic content |
-| POST | `/api/courses/<id>/content/<order>/chat` | any | RAG chat for a subtopic |
+| GET/PUT | `/api/courses/<id>/subtopics` | auth/admin | Get subtopics / save + reorder subtopic list |
+| POST | `/api/courses/<id>/content/generate` | admin | Enqueue bulk content generation for all subtopics |
+| GET | `/api/courses/<id>/content/status` | ✓ auth | Per-subtopic generation status |
+| GET/POST/PUT | `/api/courses/<id>/content/<order>` | auth/admin | Fetch / generate / save subtopic content |
+| POST | `/api/courses/<id>/content/<order>/chat` | ✓ auth | RAG chat for a subtopic |
 
 ---
 
@@ -172,19 +199,22 @@ API available at `http://localhost:8000`.
 ## Key Concepts
 
 ### Authentication
-JWT tokens are issued on register/login and set as HTTP-only cookies (7-day expiry). The `@require_auth` decorator validates the `Authorization: Bearer <token>` header and injects `request.user_id`, `request.user_email`, and `request.user_role`. Admin-only views additionally call `@require_role("SUPER_ADMIN")`.
+JWT tokens are issued on register/login and set as HTTP-only cookies (`rm_access_token` 15-min, `rm_refresh_token` 7-day). The `@require_auth` decorator accepts the cookie or the `Authorization: Bearer <token>` header and injects `request.user_id`, `request.user_email`, `request.user_name`, and `request.user_role`. Admin-only views use `@require_role("SUPER_ADMIN")`.
+
+### Analysis Credits
+Each user has a `uses_left` counter (default set on registration). `POST /api/analysis` decrements it atomically — returns `429` when exhausted. `GET /api/auth/me` includes `usesLeft` so the frontend can gate the UI.
 
 ### Resume Processing
-Uploaded PDFs are stored in S3. Text is extracted with PyMuPDF, chunked, and embedded locally using `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim). Vectors are stored in PostgreSQL via pgvector. The `indexStatus` field (`processing → ready | error`) is polled by the frontend.
+Uploaded PDFs are written to `uploads/resumes/` on disk. Text is extracted with PyMuPDF, skills are extracted with a local service, and the record is saved. Embedding indexing runs in a background thread (`threading.Thread`): text is chunked and embedded via `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim) into PostgreSQL via pgvector. The `indexStatus` field (`processing → ready | error`) is polled by the frontend.
 
 ### Course Content Generation
-1. Admin uploads a source PDF to S3 via a presigned URL
-2. **Subtopic generation** — a `TaskRecord` is created, then a message is published to the `subtopics_generation` RabbitMQ queue. `subtopic_worker.py` picks it up, streams the PDF from S3, calls Gemini Flash, and writes a structured subtopic list to the DB. The frontend polls the task status endpoint every 2 s.
-3. **Per-subtopic content generation** — admin triggers generation per subtopic. A message is published to `content_generation`; `content_worker.py` calls `GeminiService.generate_subtopic_content()`, uploads the result JSON to S3, and embeds content chunks (768-dim via Gemini `text-embedding-004`) into PostgreSQL for RAG search.
+1. Admin uploads a source PDF to S3 via a presigned PUT URL
+2. **Subtopic generation** — a `TaskRecord` is created, then a message is published to the `subtopics_generation` RabbitMQ queue. `subtopic_worker.py` streams the PDF from S3, calls Gemini, and writes a structured subtopic list to the DB. The frontend polls the task status endpoint every 2 s.
+3. **Per-subtopic content generation** — a message is published to `content_generation`; `content_worker.py` calls `GeminiService.generate_subtopic_content()`, uploads the result JSON to S3, and embeds content chunks (768-dim via Gemini `text-embedding-004`) into PostgreSQL for RAG search.
 4. **Bulk generation** — `POST /content/generate` enqueues a single message to `bulk_content_generation`; `bulk_content_worker.py` runs subtopics sequentially, acting as a natural rate-limit throttle for the Gemini free tier.
 
 ### RabbitMQ Workers
-Workers use `pika` with heartbeat disabled (`heartbeat=0`) so that long-running Gemini API calls (30–120 s for PDF analysis) never cause RabbitMQ to close the connection mid-task. Each worker auto-reconnects with exponential backoff (5 s → 60 s) on connection loss.
+Workers use `pika` with `heartbeat=0` so long-running Gemini API calls (30–120 s for PDF analysis) never cause RabbitMQ to close the connection mid-task. Each worker auto-reconnects with exponential backoff (5 s → 60 s) on connection loss.
 
 ### RAG Chat
 `POST /api/courses/<id>/content/<order>/chat`:
@@ -195,6 +225,6 @@ Workers use `pika` with heartbeat disabled (`heartbeat=0`) so that long-running 
 
 ### CI
 GitHub Actions (`.github/workflows/django.yml`) runs on every push/PR to `main`:
-- Spins up `pgvector/pgvector:pg16` as a service
 - Installs dependencies via `uv` (GPU-only packages stripped for CPU-only runners)
-- `manage.py check` → `migrate` → `test`
+- Uses in-memory SQLite (`config/test_settings.py`) — no external DB service required
+- `manage.py check` → `manage.py test`
