@@ -42,5 +42,5 @@ jobs:
       - name: Verify build
         run: python manage.py check
 
-      - name: Run tests
-        run: python manage.py test --no-input
+      - name: Run unit tests
+        run: python manage.py test tests --no-input --verbosity=2

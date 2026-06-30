@@ -138,3 +138,4 @@ wcwidth==0.8.1
 websockets==15.0.1
 xxhash==3.7.0
 zstandard==0.25.0
+reportlab==4.2.5

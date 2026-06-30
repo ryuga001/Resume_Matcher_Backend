@@ -1,6 +1,6 @@
 # Sahara — Backend
 
-Django REST API powering resume analysis, AI-driven ATS scoring, and the Sahara Academy course platform with RAG-based AI tutoring.
+Django 6 REST API powering AI-driven ATS resume analysis, a resume builder pipeline, and the Sahara Academy course platform with RAG-based AI tutoring.
 
 ---
 
@@ -8,223 +8,235 @@ Django REST API powering resume analysis, AI-driven ATS scoring, and the Sahara 
 
 | Layer | Technology |
 |-------|-----------|
-| API | Django 6 + Django REST Framework |
+| Framework | Django 6 + Django REST Framework |
 | Database | PostgreSQL 16 + pgvector |
-| Task queue | RabbitMQ + pika — three dedicated worker processes |
-| AI / LLM | Google Gemini via `google-genai` SDK |
-| Resume embeddings | `sentence-transformers` — `all-MiniLM-L6-v2` (384-dim, local, GPU-accelerated via PyTorch) |
-| Course embeddings | Gemini `text-embedding-004` (768-dim) |
-| Storage | AWS S3 (or any S3-compatible store via `S3_ENDPOINT_URL`) — used for course PDFs/thumbnails and subtopic content JSON |
-| Auth | PyJWT — stateless Bearer tokens + HTTP-only cookies (access: 15 min, refresh: 7 days) |
+| File storage | AWS S3 / MinIO (S3-compatible) |
+| AI / LLM | Google Gemini (`google-genai`) |
+| Embeddings | `sentence-transformers` — `all-MiniLM-L6-v2` (384-dim, local) |
 | PDF parsing | PyMuPDF (`fitz`) |
-| Package manager | uv |
+| PDF generation | ReportLab |
+| Auth | PyJWT — access token 15 min + refresh token 7 days, HTTP-only cookies |
+| Async workers | RabbitMQ + `pika` (3 workers: subtopic, content, bulk_content) |
+| Cache / broker | Redis |
 
 ---
 
-## Project Structure
+## Project Layout
 
 ```
 backend/
-├── config/
-│   ├── settings.py          # All config — env-driven
-│   ├── test_settings.py     # CI overrides (in-memory SQLite, no migrations)
-│   └── urls.py              # Root URL conf
-├── users/                   # Auth: register, login, JWT, profile, refresh, logout
-│   ├── api/
-│   │   ├── views.py
-│   │   └── urls.py
-│   ├── auth.py              # @require_auth / @require_role decorators
-│   ├── service.py           # AuthService — JWT issue/verify, password hashing
-│   ├── repository.py        # UserRepository — ORM queries, usesLeft tracking
-│   └── models.py
-├── resumes/                 # PDF upload → local storage, text extraction, embedding index
-│   ├── api/
+├── config/              Django settings, root URL conf, WSGI/ASGI
+├── users/               Auth — register, login, logout, refresh, profile
+├── resumes/             Resume upload, S3 storage, builder pipeline
 │   ├── services/
-│   │   ├── resume_service.py         # Orchestrator: parse → skills → save → async index
-│   │   ├── resume_parser_service.py  # PyMuPDF text extraction
-│   │   └── skill_extraction_service.py
-│   ├── repositories/
-│   └── models.py
-├── analysis/                # ATS scoring, skill-gap analysis, history
-│   ├── api/
-│   │   ├── views.py
-│   │   └── urls.py
-│   ├── repository/
-│   │   └── analysis_repository.py
-│   ├── service/
-│   │   └── analysis_service.py
-│   └── models.py
-├── courses/                 # Academy: courses, subtopics, content generation, RAG chat
-│   ├── api/
-│   │   ├── views.py         # All course API views
-│   │   └── urls.py
-│   ├── models.py            # Course, Subtopic, TaskRecord (ORM)
-│   ├── repository.py        # DB queries
-│   └── task_handlers.py     # Business logic called by workers
-├── embeddings/              # Resume embedding service (MiniLM)
-│   ├── service/
+│   │   ├── formatters/  Strategy pattern — PDF formatter (ReportLab)
+│   │   ├── enhancers/   Decorator pattern — skills / keyword / summary enhancers
+│   │   ├── resume_structurer_service.py   Gemini: raw text → structured JSON
+│   │   ├── resume_builder_service.py      Orchestrator
+│   │   ├── resume_parser_service.py       PyMuPDF text extraction
+│   │   └── resume_service.py              Upload flow (parse → skills → S3 → embed)
 │   └── repositories/
+├── analysis/            ATS scoring via Gemini + pgvector RAG retrieval
+│   └── service/
+│       ├── analysis_service.py
+│       ├── retrieval_service.py
+│       └── prompt_builder.py
+├── embeddings/          Chunking + MiniLM embedding + pgvector indexing
+├── courses/             Sahara Academy — course CRUD, subtopic/content generation
+├── workers/             RabbitMQ consumers (subtopic / content / bulk_content)
 ├── common/
-│   ├── gemini.py            # GeminiService: subtopics, content gen, RAG chat
-│   ├── embeddings.py        # EmbeddingService: Gemini text-embedding-004
-│   ├── rabbitmq.py          # publish() / consume() helpers with auto-reconnect
-│   └── s3.py                # S3Service: presign, upload, download, stream
-├── workers/
-│   ├── subtopic_worker.py   # Consumes 'subtopics_generation' queue
-│   ├── content_worker.py    # Consumes 'content_generation' queue
-│   └── bulk_content_worker.py  # Consumes 'bulk_content_generation' queue
-├── uploads/
-│   └── resumes/             # Local PDF storage for uploaded resumes
+│   ├── ai/llm_service.py   Gemini client wrapper
+│   ├── s3.py               S3/MinIO client (presign, upload, delete, stream)
+│   ├── embeddings.py       MiniLM inference helper
+│   └── rabbitmq.py         RabbitMQ connection helper
 └── manage.py
 ```
 
-> **Note:** `rag/` and `chat/` directories exist in the repo but are not registered in `INSTALLED_APPS` and have no URL routes. They are unused stubs.
-
 ---
 
-## API Endpoints
-
-All routes except `register`, `login`, `logout`, and `refresh` require a valid JWT — passed as the `rm_access_token` HTTP-only cookie or the `Authorization: Bearer <token>` header.  
-Admin routes additionally require `role == "SUPER_ADMIN"`.
+## API Reference
 
 ### Auth — `/api/auth/`
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/auth/register` | — | Create account |
-| POST | `/api/auth/login` | — | Login — sets `rm_access_token` (15 min) and `rm_refresh_token` (7 days) cookies |
-| POST | `/api/auth/logout` | — | Clear auth cookies |
-| POST | `/api/auth/refresh` | — | Issue new access token from refresh cookie |
-| GET | `/api/auth/me` | ✓ | Current user profile + `usesLeft` credits |
-| PATCH | `/api/auth/profile` | ✓ | Update name / password |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `register` | Create account, set HTTP-only cookies |
+| `POST` | `login` | Authenticate, set HTTP-only cookies |
+| `POST` | `logout` | Clear cookies |
+| `POST` | `refresh` | Rotate access token using refresh cookie |
+| `GET` | `me` | Current user profile |
+| `PUT` | `profile` | Update name / email / password |
 
-### Resumes — `/api/resumes/`
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/resumes/list` | ✓ | List user's resumes |
-| POST | `/api/resumes/upload` | ✓ | Upload PDF, extract text + skills, async embedding index |
-| DELETE | `/api/resumes/<id>` | ✓ | Delete resume record |
-
-### Analysis — `/api/analysis`
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/analysis` | ✓ | Run ATS analysis — costs 1 credit (`usesLeft`), returns score, skills, recommendations |
-| GET | `/api/analysis/history` | ✓ | Full analysis history |
-| GET | `/api/analysis/<id>` | ✓ | Single analysis detail |
-
-### Academy — `/api/courses`
-
-| Method | Path | Role | Description |
-|--------|------|------|-------------|
-| GET | `/api/courses` | ✓ auth | List courses (search, category, status filters) |
-| POST | `/api/courses` | admin | Create course |
-| GET | `/api/courses/<id>` | ✓ auth | Course detail |
-| PATCH | `/api/courses/<id>` | admin | Update course |
-| DELETE | `/api/courses/<id>` | admin | Delete course + S3 assets |
-| POST | `/api/courses/presign` | admin | Presign S3 PUT for source PDF / thumbnail |
-| POST | `/api/courses/<id>/subtopics/generate` | admin | Enqueue subtopic generation (returns `taskId`) |
-| GET | `/api/courses/<id>/subtopics/status/<taskId>` | admin | Poll subtopic task status |
-| GET/PUT | `/api/courses/<id>/subtopics` | auth/admin | Get subtopics / save + reorder subtopic list |
-| POST | `/api/courses/<id>/content/generate` | admin | Enqueue bulk content generation for all subtopics |
-| GET | `/api/courses/<id>/content/status` | ✓ auth | Per-subtopic generation status |
-| GET/POST/PUT | `/api/courses/<id>/content/<order>` | auth/admin | Fetch / generate / save subtopic content |
-| POST | `/api/courses/<id>/content/<order>/chat` | ✓ auth | RAG chat for a subtopic |
+Cookies: `rm_access_token` (15 min) + `rm_refresh_token` (7 days).
+`SameSite=None; Secure` in production (`COOKIE_SECURE=true`), `SameSite=Lax` in development.
 
 ---
 
-## Setup
+### Resumes — `/api/resumes/`
 
-**Prerequisites:** Python 3.12+, PostgreSQL 16 with pgvector, RabbitMQ 3+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `upload` | Upload PDF → extract text → embed → store in S3 |
+| `GET` | `list` | All resumes for the authenticated user |
+| `DELETE` | `<id>` | Delete record + S3 original + S3 customized |
+| `GET` | `<id>/view` | Presigned GET URL for original PDF (10 min TTL) |
+| `GET` | `<id>/structured` | Parse resume → structured JSON via Gemini (result cached in DB) |
+| `POST` | `<id>/build` | Apply ATS recommendations via Gemini + decorator chain |
+| `POST` | `<id>/export` | Render PDF → temp S3 key → presigned download URL |
+| `GET` | `<id>/customized` | Presigned URL for the saved customized PDF |
+| `POST` | `<id>/customized` | Render PDF → upload to permanent S3 key → persist key |
 
-```bash
-cd backend
-uv venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
+---
+
+### Analysis — `/api/analysis`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `` | Run ATS analysis (pgvector retrieval + Gemini) |
+| `GET` | `/history` | List all analyses for the authenticated user |
+| `GET` | `/<id>` | Single analysis detail |
+
+---
+
+### Courses — `/api/courses`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `` | List all courses |
+| `POST` | `/presign` | Presigned PUT URL for PDF/thumbnail upload |
+| `GET/POST` | `/<id>/subtopics` | Get subtopics or trigger generation via RabbitMQ |
+| `GET` | `/<id>/subtopics/status/<task_id>` | Poll subtopic generation |
+| `POST` | `/<id>/content/generate` | Trigger content generation for all subtopics |
+| `GET` | `/<id>/content/status/<task_id>` | Poll content generation |
+| `GET` | `/<id>/subtopics/<order>` | Get single subtopic with generated content |
+| `POST` | `/<id>/subtopics/<order>/chat` | RAG chat for a subtopic |
+
+---
+
+## Resume Builder — Design Patterns
+
+```
+resumes/services/
+├── formatters/
+│   ├── base_formatter.py     # Strategy interface — ResumeFormatter(ABC)
+│   ├── pdf_formatter.py      # Concrete strategy — PDFResumeFormatter (ReportLab)
+│   └── factory.py            # Factory — ResumeFormatterFactory.create("pdf")
+│
+├── enhancers/
+│   ├── base_enhancer.py      # Decorator base — ResumeEnhancer(ABC), wraps chain
+│   ├── skills_enhancer.py    # Merges missing skills into skills[]
+│   ├── keyword_enhancer.py   # Injects job keywords into latest experience entry
+│   └── summary_enhancer.py   # Prepends top recommendation to summary
+│
+├── resume_structurer_service.py   # Gemini: raw text → structured JSON
+└── resume_builder_service.py      # Orchestrator: structure → enhance → render → upload
 ```
 
-Create `backend/.env`:
+Decorator chain at runtime:
+```python
+SummaryEnhancer(KeywordEnhancer(SkillsEnhancer())).enhance(data, context)
+```
+
+---
+
+## Resume Upload Flow
+
+```
+POST /api/resumes/upload
+  ├─ 1. Write PDF to tempfile
+  ├─ 2. PyMuPDF → extract text
+  ├─ 3. SkillExtractionService → skills[]
+  ├─ 4. S3Service.upload_file() → s3_key
+  ├─ 5. os.unlink(tempfile)
+  ├─ 6. ResumeRepository.save_resume()
+  └─ 7. Thread: IndexingService → MiniLM → pgvector
+```
+
+## ATS Analysis Flow
+
+```
+POST /api/analysis
+  ├─ 1. AnalysisService.analyze() — retrieval + Gemini
+  ├─ 2. user_repo.decrement_uses()
+  └─ 3. AnalysisRepository.save()
+```
+
+Credits are decremented **after** a successful Gemini response — a failed call never costs a credit.
+
+---
+
+## Environment Variables
 
 ```env
-DJANGO_SECRET_KEY=your-secret-key-32-chars-minimum
-JWT_SECRET=your-jwt-secret-32-chars-minimum
-DEBUG=True
+# Django
+SECRET_KEY=
+DEBUG=true
+ALLOWED_HOSTS=localhost,127.0.0.1
 
-POSTGRES_DB=sahara
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
+# Database
+DATABASE_URL=postgresql://user:pass@localhost:5432/sahara
 
-RABBITMQ_URL=amqp://guest:guest@localhost:5672/
+# AWS / MinIO
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+AWS_S3_BUCKET=matchkit
+AWS_REGION=us-east-1
+S3_ENDPOINT_URL=http://localhost:9000   # omit for real AWS
 
-GEMINI_API_KEY=AIza...
+# Gemini
+GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.0-flash
 
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_S3_BUCKET=sahara
-AWS_REGION=us-east-1
-# S3_ENDPOINT_URL=http://localhost:9000  # uncomment for local S3-compatible store
+# Auth
+JWT_SECRET=
+COOKIE_SECURE=false   # true in production → SameSite=None; Secure
 
-FRONTEND_URI=http://localhost:3000
-COOKIE_SECURE=false
+# RabbitMQ
+RABBITMQ_URL=amqp://guest:guest@localhost:5672/
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
 ```
 
+---
+
+## Local Setup
+
 ```bash
-# Apply migrations (creates tables + enables pgvector extension)
+# 1. Start infrastructure (PostgreSQL, RabbitMQ, Redis, MinIO, Mailpit)
+docker compose up -d
+
+# 2. Create virtual environment
+python -m venv .venv && source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Apply migrations
 python manage.py migrate
 
-# Start the Django API
+# 5. Run dev server
 python manage.py runserver
 
-# Start workers — each in its own terminal, .venv activated, from backend/
+# 6. Start async workers (separate terminals)
 python workers/subtopic_worker.py
 python workers/content_worker.py
 python workers/bulk_content_worker.py
 ```
 
-Or use Docker Compose for all infrastructure (PostgreSQL, RabbitMQ, Redis, Mailpit):
-
-```bash
-docker compose up -d
-```
-
-API available at `http://localhost:8000`.
+| Service | URL |
+|---------|-----|
+| Django API | http://localhost:8000 |
+| MinIO console | http://localhost:9001 |
+| RabbitMQ console | http://localhost:15672 |
+| Mailpit | http://localhost:8025 |
 
 ---
 
-## Key Concepts
+## Database Migrations
 
-### Authentication
-JWT tokens are issued on register/login and set as HTTP-only cookies (`rm_access_token` 15-min, `rm_refresh_token` 7-day). The `@require_auth` decorator accepts the cookie or the `Authorization: Bearer <token>` header and injects `request.user_id`, `request.user_email`, `request.user_name`, and `request.user_role`. Admin-only views use `@require_role("SUPER_ADMIN")`.
-
-### Analysis Credits
-Each user has a `uses_left` counter (default set on registration). `POST /api/analysis` decrements it atomically — returns `429` when exhausted. `GET /api/auth/me` includes `usesLeft` so the frontend can gate the UI.
-
-### Resume Processing
-Uploaded PDFs are written to `uploads/resumes/` on disk. Text is extracted with PyMuPDF, skills are extracted with a local service, and the record is saved. Embedding indexing runs in a background thread (`threading.Thread`): text is chunked and embedded via `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim) into PostgreSQL via pgvector. The `indexStatus` field (`processing → ready | error`) is polled by the frontend.
-
-### Course Content Generation
-1. Admin uploads a source PDF to S3 via a presigned PUT URL
-2. **Subtopic generation** — a `TaskRecord` is created, then a message is published to the `subtopics_generation` RabbitMQ queue. `subtopic_worker.py` streams the PDF from S3, calls Gemini, and writes a structured subtopic list to the DB. The frontend polls the task status endpoint every 2 s.
-3. **Per-subtopic content generation** — a message is published to `content_generation`; `content_worker.py` calls `GeminiService.generate_subtopic_content()`, uploads the result JSON to S3, and embeds content chunks (768-dim via Gemini `text-embedding-004`) into PostgreSQL for RAG search.
-4. **Bulk generation** — `POST /content/generate` enqueues a single message to `bulk_content_generation`; `bulk_content_worker.py` runs subtopics sequentially, acting as a natural rate-limit throttle for the Gemini free tier.
-
-### RabbitMQ Workers
-Workers use `pika` with `heartbeat=0` so long-running Gemini API calls (30–120 s for PDF analysis) never cause RabbitMQ to close the connection mid-task. Each worker auto-reconnects with exponential backoff (5 s → 60 s) on connection loss.
-
-### RAG Chat
-`POST /api/courses/<id>/content/<order>/chat`:
-1. Loads subtopic content JSON from S3 as base context
-2. Narrows context using cosine-similarity search over pgvector course chunk embeddings
-3. Calls `GeminiService.chat_subtopic()` with the full conversation history
-4. Returns the model's reply
-
-### CI
-GitHub Actions (`.github/workflows/django.yml`) runs on every push/PR to `main`:
-- Installs dependencies via `uv` (GPU-only packages stripped for CPU-only runners)
-- Uses in-memory SQLite (`config/test_settings.py`) — no external DB service required
-- `manage.py check` → `manage.py test`
+| File | Change |
+|------|--------|
+| `0001_initial.py` | Initial Resume model |
+| `0002_resume_s3_key.py` | Added `s3_key` |
+| `0003_resume_builder_fields.py` | Added `customized_s3_key` + `structured_data` |

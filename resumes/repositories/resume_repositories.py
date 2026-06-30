@@ -33,26 +33,40 @@ class ResumeRepository:
     def set_index_status(self, resume_id: str, status: str) -> None:
         Resume.objects.filter(id=int(resume_id)).update(index_status=status)
 
-    def delete_resume(self, resume_id: str, user_id: str) -> str | None:
-        """Delete the record and return the s3_key (if any) so the caller can clean S3."""
+    def delete_resume(self, resume_id: str, user_id: str) -> dict | None:
+        """Delete the record; return {s3Key, customizedS3Key} so the caller can clean S3."""
         try:
             resume = Resume.objects.get(id=int(resume_id), user_id=int(user_id))
         except Resume.DoesNotExist:
             return None
-        s3_key = resume.s3_key or ""
+        keys = {"s3Key": resume.s3_key or "", "customizedS3Key": resume.customized_s3_key or ""}
         resume.delete()
-        return s3_key
+        return keys
+
+    def save_structured_data(self, resume_id: str, user_id: str, data: dict) -> bool:
+        updated = Resume.objects.filter(id=int(resume_id), user_id=int(user_id)).update(
+            structured_data=data
+        )
+        return bool(updated)
+
+    def save_customized_key(self, resume_id: str, user_id: str, key: str) -> bool:
+        updated = Resume.objects.filter(id=int(resume_id), user_id=int(user_id)).update(
+            customized_s3_key=key
+        )
+        return bool(updated)
 
     @staticmethod
     def _serialize(r: Resume) -> dict:
         return {
-            "_id":         str(r.id),
-            "resumeId":    str(r.id),
-            "userId":      str(r.user_id),
-            "fileName":    r.file_name,
-            "resumeText":  r.resume_text,
-            "skills":      r.skills,
-            "s3Key":       r.s3_key,
-            "uploadedAt":  r.uploaded_at,
-            "indexStatus": r.index_status,
+            "_id":              str(r.id),
+            "resumeId":         str(r.id),
+            "userId":           str(r.user_id),
+            "fileName":         r.file_name,
+            "resumeText":       r.resume_text,
+            "skills":           r.skills,
+            "s3Key":            r.s3_key,
+            "customizedS3Key":  r.customized_s3_key,
+            "structuredData":   r.structured_data,
+            "uploadedAt":       r.uploaded_at,
+            "indexStatus":      r.index_status,
         }
